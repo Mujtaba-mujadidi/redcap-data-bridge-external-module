@@ -1,0 +1,45 @@
+{
+  "name": "RedcapDataBridge",
+  "description": "This module transmits REDCap Data from one project to another",
+  "namespace": "OxfordVaccineGroup\\RedcapDataBridge",
+  "framework-version": 3,
+  "permissions": [
+    "redcap_survey_acknowledgement_page"
+    
+  ],
+  "authors": [
+    {
+      "name": "Mujtaba Ghulam Farooq",
+      "email": "mujtaba.farooq@paediatrics.ox.ac.uk",
+      "institution": "Oxford Vaccine Group"
+    }, 
+    {
+      "name": "Yama Mujadidi",
+      "email": "yama.farooq@paediatrics.ox.ac.uk",
+      "institution": "Oxford Vaccine Group"
+    }
+  ],
+  "project-settings": [
+    {
+      "key" : "dm_email",
+      "name" : "Lead Data Manager Email",
+      "required" : true,
+      "type" : "email",
+      "default" : ""
+    },
+    {
+      "key": "api_url",
+      "name": "Data Transmission URL",
+      "required": true,
+      "type": "text",
+      "default": ""
+    },
+    {
+      "key": "api_key",
+      "name": "API Key",
+      "required": true,
+      "type": "text",
+      "default": ""
+    }
+  ]
+}
