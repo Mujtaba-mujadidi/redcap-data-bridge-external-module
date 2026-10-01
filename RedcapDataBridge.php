@@ -2,211 +2,866 @@
 
 namespace OxfordVaccineGroup\RedcapDataBridge;
 
-use ExternalModules\ExternalModules;
 use REDCap;
 
 class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
 {
+    // Data Bridge action tag used to identify fields that should be transmitted to a target REDCap project.
+    private const ACTION_TAG = '@RDB-MAP';
+    private const STATUS_SUCCESS = 'SUCCESS';
+    private const STATUS_FAILED = 'FAILED';
 
-    // function redcap_save_record($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance)
-    // {
-    //     $this->pushDataToParentServer($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance);
-    // }
+    // Cache parsed tag configs per project/instrument for the duration of the request.
+    private array $configCache = [];
 
-    function redcap_survey_acknowledgement_page($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance)
+    public function redcap_survey_acknowledgement_page($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance)
     {
-        $this->pushDataToParentServer($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance);
+        static $isHandlingTransmission = false;
+
+        // Prevent recursive calls and skip if required parameters are missing.
+        if (
+            $isHandlingTransmission ||
+            $record === '' ||
+            $instrument === '' ||
+            empty($project_id) ||
+            empty($event_id)
+        ) {
+            return;
+        }
+
+
+        $configs = $this->getTransmissionConfigs((int) $project_id, (string) $instrument);
+        if (empty($configs)) {
+            return;
+        }
+
+        $apiUrl = trim((string) $this->getProjectSetting('api_url'));
+        $apiToken = trim((string) $this->getProjectSetting('api_key'));
+
+        if ($apiUrl === '' || $apiToken === '') {
+            $this->log('RDB-MAP transmission skipped because api_url or api_key is not configured.', []);
+            return;
+        }
+
+        $isHandlingTransmission = true;
+
+        try {
+            $project = new \Project((int) $project_id);
+            $sourceInstance = $this->normaliseInstance($repeat_instance);
+            $sourceRepeatInstrument = $project->isRepeatingForm($event_id, $instrument) ? (string) $instrument : '';
+
+            foreach ($configs as $config) {
+                $this->processTransmissionConfig(
+                    $project,
+                    (int) $project_id,
+                    (string) $record,
+                    (string) $instrument,
+                    (int) $event_id,
+                    $sourceInstance,
+                    $sourceRepeatInstrument,
+                    $apiUrl,
+                    $apiToken,
+                    $config
+                );
+            }
+        } finally {
+            $isHandlingTransmission = false;
+        }
     }
 
-    private function pushData($url, $token, $dataJson)
+    /**
+     * Executes one parsed tag configuration from start to finish.
+     *
+     * This method validates preconditions, reads source values, builds payload,
+     * imports to target REDCap, and records SUCCESS/FAILED state.
+     */
+    private function processTransmissionConfig(
+        \Project $project,
+        int $projectId,
+        string $record,
+        string $instrument,
+        int $eventId,
+        int $sourceInstance,
+        string $sourceRepeatInstrument,
+        string $apiUrl,
+        string $apiToken,
+        array $config
+    ): void {
+        $statusField = (string) ($config['status_field'] ?? '');
+
+        try {
+            if (!$this->conditionPasses($projectId, $record, $eventId, $sourceInstance, $sourceRepeatInstrument, $instrument, $config)) {
+                return;
+            }
+
+            if (!$this->statusFieldIsValid($project, $instrument, $statusField)) {
+                return;
+            }
+
+            $sourceFields = $this->getSourceFieldsForConfig($config);
+            $sourceData = empty($sourceFields)
+                ? []
+                : $this->getCurrentSourceRow($project, $projectId, $record, $instrument, $eventId, $sourceInstance, $sourceFields);
+
+            if (!empty($sourceFields) && empty($sourceData)) {
+                $this->log(
+                    'RDB-MAP skipped tag on field "' . $config['source_field'] .
+                    '" because no source data was found for record "' . $record . '".'
+                    , []
+                );
+                return;
+            }
+
+            if ($this->sourceStatusBlocksTransmission($sourceData, $statusField)) {
+                return;
+            }
+
+            $payload = $this->buildPayload($project, $record, $instrument, $eventId, $sourceInstance, $sourceData, $config);
+            $targetRecordValue = (string) ($payload[$config['target_record_field']] ?? '');
+
+            if ($targetRecordValue === '') {
+                $this->log(
+                    'RDB-MAP skipped tag on field "' . $config['source_field'] .
+                    '" because the target record value resolved to blank.'
+                    , []
+                );
+                return;
+            }
+
+            $this->importPayload($apiUrl, $apiToken, $payload);
+            $this->saveSourceStatusSafely($project, $projectId, $record, $instrument, $eventId, $sourceInstance, $statusField, self::STATUS_SUCCESS);
+        } catch (\Throwable $exception) {
+            $message = 'RDB-MAP failed for record "' . $record . '" on instrument "' . $instrument .
+                '" from tag #' . $config['tag_index'] . ' on field "' . $config['source_field'] .
+                '": ' . $exception->getMessage();
+
+            $this->saveSourceStatusSafely($project, $projectId, $record, $instrument, $eventId, $sourceInstance, $statusField, self::STATUS_FAILED);
+            $this->log($message, []);
+        }
+    }
+
+    /**
+     * Evaluates an optional REDCap logic expression for a mapping config.
+     *
+     * Empty condition means "always true".
+     */
+    private function conditionPasses(
+        int $projectId,
+        string $record,
+        int $eventId,
+        int $sourceInstance,
+        string $sourceRepeatInstrument,
+        string $instrument,
+        array $config
+    ): bool {
+        $condition = trim((string) ($config['condition'] ?? ''));
+        if ($condition === '') {
+            return true;
+        }
+
+        return REDCap::evaluateLogic(
+            $condition,
+            $projectId,
+            $record,
+            $eventId,
+            $sourceInstance,
+            $sourceRepeatInstrument,
+            $instrument
+        ) === true;
+    }
+
+    /**
+     * Builds and caches all RDB-MAP transmission configs for one instrument.
+     *
+     * Source of truth is REDCap metadata (data dictionary) for fields on the
+     * current instrument. For each field annotation containing @RDB-MAP, this
+     * method delegates parsing to extractTagConfigs() and flattens all parsed
+     * tags into a single config list.
+     *
+     * @param int $projectId Current REDCap project id.
+     * @param string $instrument Instrument name whose fields should be scanned.
+     * @return array<int, array<string, mixed>> Parsed config objects.
+     */
+    private function getTransmissionConfigs(int $projectId, string $instrument): array
     {
-        $data = array(
-            'token' => $token,
+        //If the configs for this project/instrument are already cached, return them.
+        if (isset($this->configCache[$projectId][$instrument])) {
+            return $this->configCache[$projectId][$instrument];
+        }
+
+        $instrumentFields = REDCap::getFieldNames($instrument);
+        if (empty($instrumentFields)) {
+            $this->configCache[$projectId][$instrument] = [];
+            return [];
+        }
+
+
+        $fieldsAttributes = REDCap::getDataDictionary($projectId, 'array', false, $instrumentFields);
+        $configs = [];
+
+        foreach ($fieldsAttributes as $fieldAttribute) {
+            $annotation = trim((string) ($fieldAttribute['field_annotation'] ?? ''));
+            //Skip if field annotation is empty or does not contain the action tag.
+            if ($annotation === '' || stripos($annotation, self::ACTION_TAG) === false) {
+                continue;
+            }
+
+            $fieldName = (string) ($fieldAttribute['field_name'] ?? '');
+            foreach ($this->extractTagConfigs($annotation, $fieldName) as $config) {
+                $configs[] = $config;
+            }
+        }
+
+        $this->configCache[$projectId][$instrument] = $configs;
+        return $configs;
+    }
+
+    /**
+     * Extracts and normalises one or more @RDB-MAP(...) tags from a field annotation.
+     *
+     * Parsing behaviour:
+     * - Tag name matching is case-insensitive (@RDB-MAP, @rdb-map, etc.).
+     * - Attribute names are case-insensitive and normalised to lower-case keys.
+     * - Attribute values must be in double quotes (key="value").
+     * - map="source=>target" can appear multiple times and is collected as a list.
+     *
+     * Validation behaviour:
+     * - target_record_field is required per tag.
+     * - At least one valid map entry is required per tag.
+     * - Invalid tags are skipped with a log entry; parsing continues for other tags.
+     *
+     * @param string $annotation Raw REDCap field annotation text.
+     * @param string $fieldName Field name used for log context.
+     * @return array<int, array<string, mixed>> List of parsed tag configs.
+     */
+    private function extractTagConfigs(string $annotation, string $fieldName): array
+    {
+        // Match full @RDB-MAP(...) blocks.
+        // The recursive (?<inner>...) group allows nested parentheses and quoted
+        // substrings inside the tag body without prematurely terminating the match.
+        $pattern = '/@RDB-MAP\s*\(\s*(?<inner>(?:[^()"\'()]+' .
+            '|"(?:\\\\.|[^"\\\\])*"|\'(?:\\\\.|[^\'\\\\])*\'|\((?&inner)\))*)\s*\)/si';
+
+        $configs = [];
+        if (!preg_match_all($pattern, $annotation, $matches, PREG_SET_ORDER)) {
+            return $configs;
+        }
+
+        foreach ($matches as $index => $match) {
+            $rawAttributes = $match['inner'] ?? '';
+            $attributes = [];
+
+            // Parse attributes in key="value" form.
+            // Example: map="mrn=>target_mrn" target_record_field="target_id"
+            if (preg_match_all('/([a-z_]+)\s*=\s*"((?:\\\\.|[^"\\\\])*)"/i', $rawAttributes, $attributeMatches, PREG_SET_ORDER)) {
+                foreach ($attributeMatches as $attributeMatch) {
+                    $key = strtolower($attributeMatch[1]);
+                    $value = stripcslashes($attributeMatch[2]);
+
+                    // 'map' can be repeated, so we collect all entries.
+                    if ($key === 'map') {
+                        $attributes['map'][] = $value;
+                        continue;
+                    }
+
+                    $attributes[$key] = trim($value);
+                }
+            }
+
+            $targetRecordField = trim((string) ($attributes['target_record_field'] ?? ''));
+            if ($targetRecordField === '') {
+                // Required to identify/create the target record.
+                $this->log('RDB-MAP skipped a tag on field "' . $fieldName . '" because target_record_field is missing.', []);
+                continue;
+            }
+
+            // Convert raw map strings into [{source, target}, ...].
+            $maps = $this->parseMaps($attributes['map'] ?? [], $fieldName, $index + 1);
+            if (empty($maps)) {
+                // A tag without usable mappings cannot produce a payload.
+                $this->log('RDB-MAP skipped a tag on field "' . $fieldName . '" because no valid map entries were found.', []);
+                continue;
+            }
+
+            // Normalised config consumed by downstream transmission logic.
+            $configs[] = [
+                'condition' => trim((string) ($attributes['condition'] ?? '')),
+                'target_record_field' => $targetRecordField,
+                'target_form' => trim((string) ($attributes['target_form'] ?? '')),
+                'target_event' => trim((string) ($attributes['target_event'] ?? '')),
+                'status_field' => trim((string) ($attributes['status_field'] ?? '')),
+                'maps' => $maps,
+                'source_field' => $fieldName,
+                'tag_index' => $index + 1,
+            ];
+        }
+
+        return $configs;
+    }
+
+    /**
+     * Parses map="source=>target" entries into structured source/target pairs.
+     *
+     * Invalid entries are skipped and logged (missing =>, blank side, etc.).
+     *
+     * @param array<int, string> $rawMaps Raw map strings from tag attributes.
+     * @param string $fieldName Field name used for log context.
+     * @param int $tagIndex 1-based index of tag occurrence in annotation.
+     * @return array<int, array{source:string,target:string}>
+     */
+    private function parseMaps(array $rawMaps, string $fieldName, int $tagIndex): array
+    {
+        $maps = [];
+
+        foreach ($rawMaps as $rawMap) {
+            if (strpos($rawMap, '=>') === false) {
+                $this->log(
+                    'RDB-MAP skipped one map entry on field "' . $fieldName .
+                    '" in tag #' . $tagIndex . ' because it does not contain "=>".'
+                    , []
+                );
+                continue;
+            }
+
+            [$sourceField, $targetField] = array_map('trim', explode('=>', $rawMap, 2));
+            if ($sourceField === '' || $targetField === '') {
+                $this->log(
+                    'RDB-MAP skipped one map entry on field "' . $fieldName .
+                    '" in tag #' . $tagIndex . ' because the source or target field is blank.'
+                    , []
+                );
+                continue;
+            }
+
+            $maps[] = [
+                'source' => $sourceField,
+                'target' => $targetField,
+            ];
+        }
+
+        return $maps;
+    }
+
+    /**
+     * Computes source field names needed for a single config.
+     *
+     * Base checkbox names are included once, and special runtime tokens are ignored
+     * because they are resolved without reading source data.
+     *
+     * @param array<string, mixed> $config
+     * @return array<int, string>
+     */
+    private function getSourceFieldsForConfig(array $config): array
+    {
+        $fields = [];
+
+        foreach ($config['maps'] as $map) {
+            $source = (string) $map['source'];
+            if ($this->isSpecialSource($source)) {
+                continue;
+            }
+
+            $fields[] = $this->getBaseFieldName($source);
+        }
+
+        $statusField = trim((string) ($config['status_field'] ?? ''));
+        if ($statusField !== '') {
+            $fields[] = $statusField;
+        }
+
+        return array_values(array_unique($fields));
+    }
+
+    /**
+     * Retrieves the source row that matches the current submission context.
+     *
+     * For repeating data, REDCap may return multiple rows, so we select the row
+     * that matches the current instrument/event repeat instance.
+     *
+     * @param array<int, string> $fields
+     * @return array<string, mixed>
+     */
+    private function getCurrentSourceRow(
+        \Project $project,
+        int $projectId,
+        string $record,
+        string $instrument,
+        int $eventId,
+        int $sourceInstance,
+        array $fields
+    ): array {
+        $params = [
+            'project_id' => $projectId,
+            'records' => [$record],
+            'fields' => $fields,
+            'events' => [$eventId],
+            'return_format' => 'json-array',
+            // Keep checkbox choices split as field___code so the mapped payload
+            // can be sent back to REDCap in a format import supports.
+            'combine_checkbox_values' => false,
+        ];
+
+        $data = REDCap::getData($params);
+        if (!is_array($data) || empty($data)) {
+            return [];
+        }
+
+        // Repeating contexts return multiple rows here, so pick the row that
+        // matches the form/event instance that triggered the hook.
+        $isRepeatingEvent = $project->isRepeatingEvent($eventId);
+        $isRepeatingForm = $project->isRepeatingForm($eventId, $instrument);
+
+        foreach ($data as $row) {
+            $rowRepeatInstrument = (string) ($row['redcap_repeat_instrument'] ?? '');
+            $rowRepeatInstance = $this->normaliseInstance($row['redcap_repeat_instance'] ?? 1);
+
+            if ($isRepeatingForm) {
+                if ($rowRepeatInstrument === $instrument && $rowRepeatInstance === $sourceInstance) {
+                    return $row;
+                }
+                continue;
+            }
+
+            if ($isRepeatingEvent) {
+                if ($rowRepeatInstrument === '' && $rowRepeatInstance === $sourceInstance) {
+                    return $row;
+                }
+                continue;
+            }
+
+            if ($rowRepeatInstrument === '') {
+                return $row;
+            }
+        }
+
+        return $data[0];
+    }
+
+    /**
+     * Builds one target payload array from mapping rules and source data.
+     *
+     * Always sets the target record field to the source record id to keep record
+     * linkage explicit.
+     *
+     * @param array<string, mixed> $sourceData
+     * @param array<string, mixed> $config
+     * @return array<string, string>
+     */
+    private function buildPayload(
+        \Project $project,
+        string $record,
+        string $instrument,
+        int $eventId,
+        int $sourceInstance,
+        array $sourceData,
+        array $config
+    ): array {
+        $payload = [];
+
+        foreach ($config['maps'] as $map) {
+            $this->applyMapToPayload($payload, $project, $record, $instrument, $eventId, $sourceInstance, $sourceData, $map, $config);
+        }
+
+        // Keep the target record ID aligned with the source record ID.
+        $payload[$config['target_record_field']] = $record;
+
+        if ($config['target_event'] !== '') {
+            $payload['redcap_event_name'] = $config['target_event'];
+        }
+
+        if ($config['target_form'] !== '') {
+            $payload[$config['target_form'] . '_complete'] = '2';
+        }
+
+        return $payload;
+    }
+
+    /**
+     * Applies a single map entry to the outgoing payload.
+     *
+     * Supports special runtime tokens, explicit checkbox codes, and base-field
+     * checkbox expansion.
+     *
+     * @param array<string, string> $payload
+     * @param array<string, mixed> $sourceData
+     * @param array<string, string> $map
+     * @param array<string, mixed> $config
+     */
+    private function applyMapToPayload(
+        array &$payload,
+        \Project $project,
+        string $record,
+        string $instrument,
+        int $eventId,
+        int $sourceInstance,
+        array $sourceData,
+        array $map,
+        array $config
+    ): void {
+        $sourceField = (string) $map['source'];
+        $targetField = (string) $map['target'];
+
+        if ($this->isSpecialSource($sourceField)) {
+            $payload[$targetField] = $this->resolveScalarSourceValue(
+                $sourceField,
+                $project,
+                $record,
+                $instrument,
+                $eventId,
+                $sourceInstance,
+                $sourceData
+            );
+            return;
+        }
+
+        if (strpos($sourceField, '___') !== false) {
+            $payload[$targetField] = $this->normaliseFieldValue($sourceData[$sourceField] ?? '');
+            return;
+        }
+
+        $checkboxValues = $this->extractCheckboxValues($sourceField, $sourceData);
+        if (!empty($checkboxValues)) {
+            if (strpos($targetField, '___') !== false) {
+                $this->log(
+                    'RDB-MAP skipped checkbox base mapping "' . $sourceField . '=>' . $targetField .
+                    '" on field "' . $config['source_field'] . '". Use explicit checkbox codes instead.'
+                    , []
+                );
+                return;
+            }
+
+            foreach ($checkboxValues as $checkboxField => $value) {
+                $suffix = substr($checkboxField, strlen($sourceField));
+                $payload[$targetField . $suffix] = $value;
+            }
+            return;
+        }
+
+        $payload[$targetField] = $this->normaliseFieldValue($sourceData[$sourceField] ?? '');
+    }
+
+    /**
+     * Extracts checkbox values for a base field from a REDCap data row.
+     *
+     * Example base field "symptoms" matches keys like symptoms___1, symptoms___2.
+     *
+     * @param array<string, mixed> $sourceData
+     * @return array<string, string>
+     */
+    private function extractCheckboxValues(string $baseFieldName, array $sourceData): array
+    {
+        $checkboxValues = [];
+
+        foreach ($sourceData as $fieldName => $value) {
+            if (strpos((string) $fieldName, $baseFieldName . '___') !== 0) {
+                continue;
+            }
+
+            $checkboxValues[(string) $fieldName] = $this->normaliseFieldValue($value);
+        }
+
+        return $checkboxValues;
+    }
+
+    /**
+     * Resolves a map source into a scalar string value.
+     *
+     * Special tokens are resolved first; otherwise source data is read directly.
+     *
+     * @param array<string, mixed> $sourceData
+     */
+    private function resolveScalarSourceValue(
+        string $sourceField,
+        \Project $project,
+        string $record,
+        string $instrument,
+        int $eventId,
+        int $sourceInstance,
+        array $sourceData
+    ): string {
+        $specialValue = $this->resolveSpecialSourceValue($sourceField, $project, $record, $instrument, $eventId, $sourceInstance);
+        if ($specialValue !== null) {
+            return $specialValue;
+        }
+
+        return $this->normaliseFieldValue($sourceData[$sourceField] ?? '');
+    }
+
+    /**
+     * Resolves supported special source tokens to runtime values.
+     *
+     * Returns null when the source is not a recognised token.
+     */
+    private function resolveSpecialSourceValue(
+        string $sourceField,
+        \Project $project,
+        string $record,
+        string $instrument,
+        int $eventId,
+        int $sourceInstance
+    ): ?string {
+        switch (strtoupper($sourceField)) {
+            case '__RECORD_ID__':
+                return $record;
+
+            case '__EVENT_ID__':
+                return (string) $eventId;
+
+            case '__EVENT_NAME__':
+                return $project->longitudinal ? (string) $project->getUniqueEventNames($eventId) : '';
+
+            case '__REPEAT_INSTANCE__':
+                return (string) $sourceInstance;
+
+            case '__INSTRUMENT__':
+                return $instrument;
+
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Checks whether a map source is one of the supported special tokens.
+     */
+    private function isSpecialSource(string $sourceField): bool
+    {
+        return in_array(strtoupper($sourceField), [
+            '__RECORD_ID__',
+            '__EVENT_ID__',
+            '__EVENT_NAME__',
+            '__REPEAT_INSTANCE__',
+            '__INSTRUMENT__',
+        ], true);
+    }
+
+    /**
+     * Removes checkbox suffix from a field name, if present.
+     */
+    private function getBaseFieldName(string $fieldName): string
+    {
+        return strpos($fieldName, '___') !== false
+            ? (string) strstr($fieldName, '___', true)
+            : $fieldName;
+    }
+
+    /**
+     * Validates the configured status field is a text field on this instrument.
+     */
+    private function statusFieldIsValid(\Project $project, string $instrument, string $statusField): bool
+    {
+        if ($statusField === '') {
+            return true;
+        }
+
+        if (!isset($project->metadata[$statusField])) {
+            $this->log('RDB-MAP skipped because status_field "' . $statusField . '" does not exist.', []);
+            return false;
+        }
+
+        $statusFieldForm = (string) ($project->metadata[$statusField]['form_name'] ?? '');
+        if ($statusFieldForm !== $instrument) {
+            $this->log(
+                'RDB-MAP skipped because status_field "' . $statusField .
+                '" is not on the current instrument "' . $instrument . '".'
+                , []
+            );
+            return false;
+        }
+
+        $statusFieldType = (string) ($project->metadata[$statusField]['element_type'] ?? '');
+        if ($statusFieldType !== 'text') {
+            $this->log(
+                'RDB-MAP skipped because status_field "' . $statusField . '" must be a text field.',
+                []
+            );
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Returns true when status field is populated, which blocks retransmission.
+     */
+    private function sourceStatusBlocksTransmission(array $sourceData, string $statusField): bool
+    {
+        if ($statusField === '') {
+            return false;
+        }
+
+        return trim($this->normaliseFieldValue($sourceData[$statusField] ?? '')) !== '';
+    }
+
+    /**
+     * Persists SUCCESS/FAILED marker back to source project status field.
+     *
+     * Handles longitudinal and repeating context fields required by REDCap import.
+     */
+    private function saveSourceStatus(
+        \Project $project,
+        int $projectId,
+        string $record,
+        string $instrument,
+        int $eventId,
+        int $sourceInstance,
+        string $statusField,
+        string $statusValue
+    ): void {
+        if ($statusField === '') {
+            return;
+        }
+
+        $recordIdField = REDCap::getRecordIdField($projectId);
+        $payload = [
+            $recordIdField => $record,
+            $statusField => $statusValue,
+        ];
+
+        if ($project->longitudinal) {
+            $payload['redcap_event_name'] = (string) $project->getUniqueEventNames($eventId);
+        }
+
+        if ($project->isRepeatingForm($eventId, $instrument)) {
+            $payload['redcap_repeat_instrument'] = $instrument;
+            $payload['redcap_repeat_instance'] = (string) $sourceInstance;
+        } elseif ($project->isRepeatingEvent($eventId)) {
+            $payload['redcap_repeat_instance'] = (string) $sourceInstance;
+        }
+
+        $result = REDCap::saveData($projectId, 'json', json_encode([$payload]));
+        if (!empty($result['errors'])) {
+            throw new \RuntimeException('Failed to save source status field: ' . json_encode($result['errors']));
+        }
+    }
+
+    /**
+     * Best-effort status write that never throws to caller.
+     */
+    private function saveSourceStatusSafely(
+        \Project $project,
+        int $projectId,
+        string $record,
+        string $instrument,
+        int $eventId,
+        int $sourceInstance,
+        string $statusField,
+        string $statusValue
+    ): void {
+        try {
+            $this->saveSourceStatus($project, $projectId, $record, $instrument, $eventId, $sourceInstance, $statusField, $statusValue);
+        } catch (\Throwable $exception) {
+            $this->log(
+                'RDB-MAP could not save status "' . $statusValue . '" to source field "' . $statusField .
+                '" for record "' . $record . '": ' . $exception->getMessage()
+                , []
+            );
+        }
+    }
+
+    /**
+     * Imports one payload row into target REDCap via API.
+     *
+     * @param array<string, string> $payload
+     */
+    private function importPayload(string $apiUrl, string $apiToken, array $payload): void
+    {
+        $params = [
             'content' => 'record',
             'action' => 'import',
             'format' => 'json',
             'type' => 'flat',
             'overwriteBehavior' => 'normal',
-            'forceAutoNumber' => 'true',
-            'data' => $dataJson,
+            'data' => json_encode([$payload]),
             'returnContent' => 'ids',
-            'returnFormat' => 'json'
-        );
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_VERBOSE, 0);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_AUTOREFERER, true);
-        curl_setopt($ch, CURLOPT_MAXREDIRS, 10);
-        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
-        curl_setopt($ch, CURLOPT_FRESH_CONNECT, 1);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data, '', '&'));
-        $output = curl_exec($ch);
-        return $output;
-        curl_close($ch);
+            'returnFormat' => 'json',
+        ];
+
+        $this->callTargetApi($apiUrl, $apiToken, $params);
     }
 
     /**
-     * 
+     * Performs a POST request to target REDCap API and validates response.
+     *
+     * Throws RuntimeException on transport failures, HTTP errors, and API-level
+     * error responses.
+     *
+     * @param array<string, string> $params
+     * @return array<string, mixed>
      */
-    private function getRbdMap($instrument)
+    private function callTargetApi(string $url, string $token, array $params): array
     {
-        //Get the data dictionary for the current project
-        $ddJson = REDCap::getDataDictionary(
-            PROJECT_ID,               // $project_id (null uses current project)
-            'json',            // $returnFormat ('csv', 'json', or 'array')
-            true,               // $exportCsvHeadersAsLabels
-            null,               // $fields (we don't need to limit fields manually here)
-            [$instrument], // $instruments (limit to this instrument)
-            false               // $draftMode
-        );
+        $requestData = array_merge(['token' => $token], $params);
 
-        //Parse the ddJson as json
-        $ddJson = json_decode($ddJson);
+        $curl = curl_init();
+        curl_setopt($curl, CURLOPT_URL, $url);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($curl, CURLOPT_AUTOREFERER, true);
+        curl_setopt($curl, CURLOPT_MAXREDIRS, 5);
+        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 15);
+        curl_setopt($curl, CURLOPT_TIMEOUT, 60);
+        curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($curl, CURLOPT_CUSTOMREQUEST, 'POST');
+        curl_setopt($curl, CURLOPT_POSTFIELDS, http_build_query($requestData, '', '&'));
 
-        foreach ($ddJson as $fieldObject) {
-            $fieldAnnotation = $fieldObject->field_annotation;
-            //If field annotation is not empty and it contains the word @RDB-MAP then return the field object
-            if (!empty($fieldAnnotation) && stripos($fieldAnnotation, "@RDB-MAP") !== false) {
-                //extract the @RDB-MAP tag contents from the field annotation
-                // Recursive, quote-aware pattern that matches @RDB-MAP( ...balanced... )
-                $pattern = '/@RDB-MAP\s*\(\s*(?<inner>(?:[^()"\'()]+' .
-                    '|"(?:\\\\.|[^"\\\\])*"|\'(?:\\\\.|[^\'\\\\])*\'|\((?&inner)\))*)\s*\)/si';
-
-                $foundMaps = [];
-                if (preg_match_all($pattern, $fieldAnnotation, $m, PREG_SET_ORDER)) {
-                    foreach ($m as $map) {
-                        $actionTagAttributes = $map['inner'];
-                        preg_match_all('/(condition|map)="([^"]+)"/', $actionTagAttributes, $matches, PREG_SET_ORDER);
-                        foreach ($matches as $match) {
-                            $key = strtolower($match[1]);
-                            $value = trim($match[2]);
-
-                            if ($key === 'condition') {
-                                $result['condition'] = $value;
-                            } elseif ($key === 'map') {
-                                // Parse map string into associative array
-                                $pairs = array_map('trim', explode(',', $value));
-                                foreach ($pairs as $pair) {
-                                    if (strpos($pair, '=>') !== false) {
-                                        list($from, $to) = array_map('trim', explode('=>', $pair));
-                                        $result['map'][$from] = $to;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    $foundMaps[] = $result;
-                }
-                return $foundMaps;
-            }
+        $output = curl_exec($curl);
+        if ($output === false) {
+            $error = curl_error($curl);
+            curl_close($curl);
+            throw new \RuntimeException('cURL request failed: ' . $error);
         }
+
+        $statusCode = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+
+        if ($statusCode >= 400) {
+            $responseBody = trim((string) $output);
+            if ($responseBody !== '') {
+                throw new \RuntimeException('Target REDCap API returned HTTP ' . $statusCode . ': ' . $responseBody);
+            }
+
+            throw new \RuntimeException('Target REDCap API returned HTTP ' . $statusCode . '.');
+        }
+
+        $decoded = json_decode($output, true);
+        if (!is_array($decoded)) {
+            throw new \RuntimeException('Target REDCap API returned an unexpected response: ' . $output);
+        }
+
+        if (isset($decoded['error']) && $decoded['error'] !== '') {
+            throw new \RuntimeException((string) $decoded['error']);
+        }
+
+        if (!empty($decoded['errors'])) {
+            throw new \RuntimeException(json_encode($decoded['errors']));
+        }
+
+        return $decoded;
     }
 
-    function pushDataToParentServer($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance)
+    /**
+     * Converts repeat instance to a positive integer; defaults to 1.
+     */
+    private function normaliseInstance($repeatInstance): int
     {
-        $rbdMap = $this->getRbdMap($instrument);
-        if ($rbdMap) {
-            //Get the PMD project URL and API token from the project settings
-            $pmdProjectUrl = $this->getProjectSetting('api_url');
-            $pmdApiToken = $this->getProjectSetting('api_key');
-
-            //Retuen if either PMD project URL or API token is not set
-            if (empty($pmdProjectUrl) || empty($pmdApiToken)) {
-                $this->printToConsole("PMD Project URL or API token is not set. Data transmission aborted.");
-                return;
-            }
-
-            //Get the record ID field
-            $recordFieldName = REDCap::getRecordIdField($project_id);
-            //Loop through each map, check if the condition is met, and if so, get and map the data and push it to the parent server
-            foreach ($rbdMap as $map) {
-                $condition = $map["condition"];
-                $fieldsMap = $map["map"];
-                $conditionMet = true;
-                //If condition is not empty then evaluate it
-                if (!empty($condition)) {
-                    //Evaluate the condition
-                    $conditionMet = REDCap::evaluateLogic($condition, $project_id, $record, $event_id, $repeat_instance);
-                }
-
-                if ($conditionMet) {
-                    //Extract the fields from the map keys
-                    $fieldsToExtract = array_keys($fieldsMap);
-                    //Add recordFieldName to the fields if it does not exisits 
-                    if (!in_array($recordFieldName, $fieldsToExtract)) {
-                        $fieldsToExtract[] = $recordFieldName;
-                    }
-
-
-
-                    //Get the data for the specified fields from redcap
-                    $params = array('return_format' => 'json', 'records' => array($record), 'fields' => $fieldsToExtract, 'exportSurveyFields' => true);
-                    $data = REDCap::getData($params);
-                    $data = json_decode($data, true);
-                    //Map the data according to the fields map for import
-                    //Push the record id first
-                    foreach ($data as $recordData) {
-                        //Loop through each field of the recordData and if it exists in the fieldsMap then map it to the respective field
-                        foreach ($recordData as $fieldName => $value) {
-                            $fromField = (strpos($fieldName, "___") !== false) ? explode("___", $fieldName)[0] : $fieldName;
-
-                            //Check if fieldMap has the fieldName
-                            if (isset($fieldsMap[$fromField])) {
-                                $toField = $fieldsMap[$fromField];
-                                //If fieldName is a checkbox then append the code to the toField
-                                if (strpos($fieldName, "___") !== false) {
-                                    $code = explode("___", $fieldName)[1];
-                                    $toField = $toField . "___" . $code;
-                                }
-                                $mappedData[$toField] = $value;
-                            }
-                        }
-                        //Push the record id if it is not already pushed
-                        if (!isset($mappedData[$recordFieldName])) {
-                            $mappedData[$recordFieldName] = $recordData[$recordFieldName];
-                        }
-                    }
-
-                    //Print both from data and to data
-                    print_r("From Data: ");
-                    print_r($data);
-                    print_r("<br><br><br><br>To Data: ");
-                    print_r($mappedData);
-                    print_r("<br><br><br><br>");
-
-                    //Push the mapped data to the parent server
-                    $mappedDataJson = json_encode(array($mappedData));
-                    $output = $this->pushData($pmdProjectUrl, $pmdApiToken, $mappedDataJson);
-                    //check if output contains error
-                    if (strpos($output, 'error') !== false) {
-                        $toEmail = $this->getProjectSetting('dm_email');
-                        $subject = "Error pushing data to PMD server";
-                        $message = "An error occurred while pushing data to the PMD server. Error details: " . $output;
-                        $headers = "From: " . $toEmail;
-
-                        print_r("Error pushing data to PMD server: " . $output . "<br>");
-                        //CCheck if email was sent successfully
-                        if (mail($toEmail, $subject, $message, $headers)) {
-                            print_r("Error email sent successfully.");
-                        } else {
-                            print_r("Error sending error email.");
-                        }
-                    } else {
-                        print_r("Data pushed successfully to PMD server: " . $output);
-                    }
-                }
-            }
-        } else {
-            print_r("No RBD Map found for instrument: " . $instrument);
-        }
+        $instance = (int) $repeatInstance;
+        return $instance > 0 ? $instance : 1;
     }
 
-
-    function printToConsole($data)
+    /**
+     * Normalises arbitrary REDCap values to string for payload consistency.
+     */
+    private function normaliseFieldValue($value): string
     {
-        echo "<script>console.log(" . json_encode($data) . ");</script>";
+        if ($value === null) {
+            return '';
+        }
+
+        if (is_bool($value)) {
+            return $value ? '1' : '0';
+        }
+
+        return (string) $value;
     }
 }

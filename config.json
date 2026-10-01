@@ -1,6 +1,6 @@
 {
   "name": "RedcapDataBridge",
-  "description": "This module transmits REDCap Data from one project to another",
+  "description": "Transmits mapped REDCap data to another project when an @RDB-MAP condition passes on survey completion",
   "namespace": "OxfordVaccineGroup\\RedcapDataBridge",
   "framework-version": 3,
   "permissions": [
@@ -21,13 +21,6 @@
   ],
   "project-settings": [
     {
-      "key" : "dm_email",
-      "name" : "Lead Data Manager Email",
-      "required" : true,
-      "type" : "email",
-      "default" : ""
-    },
-    {
       "key": "api_url",
       "name": "Data Transmission URL",
       "required": true,
@@ -38,7 +31,7 @@
       "key": "api_key",
       "name": "API Key",
       "required": true,
-      "type": "text",
+      "type": "password",
       "default": ""
     }
   ]
