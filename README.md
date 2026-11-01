@@ -7,7 +7,7 @@ Field mappings are kept in an `@RDB-MAP(...)` action tag in the source project's
 ## Project Settings
 
 - `Data Transmission URL`: the target REDCap API endpoint.
-- `API Key`: an API token for the target project with permission to import records.
+- `API Key`: an API token for the target project with permission to import and export records.
 
 ## Action Tag
 
@@ -16,7 +16,8 @@ Add the tag to a field annotation on the source instrument. For example:
 ```text
 @RDB-MAP(
   condition="[demog_complete] = '2'",
-  target_record_field="participant_id",
+  target_record_id_field="record_id",
+  target_source_id_field="psq_id",
   target_form="demographics",
   target_event="baseline_arm_1",
   status_field="data_bridge_status",
@@ -29,7 +30,9 @@ Add the tag to a field annotation on the source instrument. For example:
 ## Tag Options
 
 - `condition` is optional REDCap logic. If it is omitted, the mapping runs whenever the survey acknowledgement page is reached.
-- `target_record_field` is required and must name the record ID field in the target project. Its value is always set to the source record ID. If the record already exists in the target project, REDCap updates it.
+- `target_record_id_field` is required and must name the primary record ID field in the target project. REDCap generates this value when a new target record is created.
+- `target_source_id_field` is required and must name a secondary field in the target project. The module stores the source record ID in this field and uses it to find the same target record later.
+- These must be two different fields.
 - `target_form` is optional. When supplied, the module marks that target form Complete by setting `<target_form>_complete` to `2`.
 - `target_event` is required when the target is longitudinal. Use the target project's unique event name. It is not needed for a classic project.
 - `status_field` is optional but recommended. It must be a text field on the same source instrument. A non-text field is logged as invalid and the transfer is skipped.
@@ -55,8 +58,21 @@ The module only attempts a transfer while this field is blank. To retry a transf
 
 The module does not send email notifications. If notifications are required, configure a REDCap Alert based on the status field's failed value.
 
+## Record Matching
+
+Before sending data, the module searches the target project for the source record ID in `target_source_id_field`.
+
+- If there is no match, REDCap creates a new record using its next auto-numbered record ID.
+- If there is one matching record, the module updates that record using its generated target record ID.
+- If more than one target record contains the same source ID, the transfer fails and the duplicate is written to the module log.
+
+The source status field remains the first check. The target lookup provides a second safeguard if the target import succeeded but the source `SUCCESS` status could not be saved.
+
+Record auto-numbering must be enabled in the target project.
+
 ## Notes
 
 - The module runs on `redcap_survey_acknowledgement_page`.
 - Multiple `@RDB-MAP(...)` tags can exist on the same instrument.
 - Each valid tag is processed separately and sends its own request to the target project.
+- Existing action tags using `target_record_field` must be updated to use `target_record_id_field` and `target_source_id_field`.

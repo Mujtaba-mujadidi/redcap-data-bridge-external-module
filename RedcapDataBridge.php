@@ -117,18 +117,20 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             }
 
             $payload = $this->buildPayload($project, $record, $instrument, $eventId, $sourceInstance, $sourceData, $config);
-            $targetRecordValue = (string) ($payload[$config['target_record_field']] ?? '');
+            $targetRecordIds = $this->findTargetRecordIds($apiUrl, $apiToken, $record, $config);
 
-            if ($targetRecordValue === '') {
-                $this->log(
-                    'RDB-MAP skipped tag on field "' . $config['source_field'] .
-                    '" because the target record value resolved to blank.'
-                    , []
+            if (count($targetRecordIds) > 1) {
+                throw new \RuntimeException(
+                    'Multiple target records contain source ID "' . $record . '" in field "' .
+                    $config['target_source_id_field'] . '".'
                 );
-                return;
             }
 
-            $this->importPayload($apiUrl, $apiToken, $payload);
+            $createNewRecord = empty($targetRecordIds);
+            // REDCap requires a provisional ID even when forceAutoNumber replaces it.
+            $payload[$config['target_record_id_field']] = $createNewRecord ? $record : $targetRecordIds[0];
+
+            $this->importPayload($apiUrl, $apiToken, $payload, $createNewRecord);
             $this->saveSourceStatusSafely($project, $projectId, $record, $instrument, $eventId, $sourceInstance, $statusField, self::STATUS_SUCCESS);
         } catch (\Throwable $exception) {
             $message = 'RDB-MAP failed for record "' . $record . '" on instrument "' . $instrument .
@@ -226,7 +228,7 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
      * - map="source=>target" can appear multiple times and is collected as a list.
      *
      * Validation behaviour:
-     * - target_record_field is required per tag.
+     * - target_record_id_field and target_source_id_field are required per tag.
      * - At least one valid map entry is required per tag.
      * - Invalid tags are skipped with a log entry; parsing continues for other tags.
      *
@@ -252,7 +254,7 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             $attributes = [];
 
             // Parse attributes in key="value" form.
-            // Example: map="mrn=>target_mrn" target_record_field="target_id"
+            // Example: map="mrn=>target_mrn" target_record_id_field="record_id"
             if (preg_match_all('/([a-z_]+)\s*=\s*"((?:\\\\.|[^"\\\\])*)"/i', $rawAttributes, $attributeMatches, PREG_SET_ORDER)) {
                 foreach ($attributeMatches as $attributeMatch) {
                     $key = strtolower($attributeMatch[1]);
@@ -268,10 +270,33 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
                 }
             }
 
-            $targetRecordField = trim((string) ($attributes['target_record_field'] ?? ''));
-            if ($targetRecordField === '') {
-                // Required to identify/create the target record.
-                $this->log('RDB-MAP skipped a tag on field "' . $fieldName . '" because target_record_field is missing.', []);
+            $targetRecordIdField = trim((string) ($attributes['target_record_id_field'] ?? ''));
+            $targetSourceIdField = trim((string) ($attributes['target_source_id_field'] ?? ''));
+
+            if ($targetRecordIdField === '' || $targetSourceIdField === '') {
+                $this->log(
+                    'RDB-MAP skipped a tag on field "' . $fieldName .
+                    '" because target_record_id_field or target_source_id_field is missing.',
+                    []
+                );
+                continue;
+            }
+
+            if (!$this->isValidFieldName($targetRecordIdField) || !$this->isValidFieldName($targetSourceIdField)) {
+                $this->log(
+                    'RDB-MAP skipped a tag on field "' . $fieldName .
+                    '" because a target ID field name is invalid.',
+                    []
+                );
+                continue;
+            }
+
+            if ($targetRecordIdField === $targetSourceIdField) {
+                $this->log(
+                    'RDB-MAP skipped a tag on field "' . $fieldName .
+                    '" because target_record_id_field and target_source_id_field must be different fields.',
+                    []
+                );
                 continue;
             }
 
@@ -286,7 +311,8 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             // Normalised config consumed by downstream transmission logic.
             $configs[] = [
                 'condition' => trim((string) ($attributes['condition'] ?? '')),
-                'target_record_field' => $targetRecordField,
+                'target_record_id_field' => $targetRecordIdField,
+                'target_source_id_field' => $targetSourceIdField,
                 'target_form' => trim((string) ($attributes['target_form'] ?? '')),
                 'target_event' => trim((string) ($attributes['target_event'] ?? '')),
                 'status_field' => trim((string) ($attributes['status_field'] ?? '')),
@@ -340,6 +366,11 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
         }
 
         return $maps;
+    }
+
+    private function isValidFieldName(string $fieldName): bool
+    {
+        return preg_match('/^[a-z][a-z0-9_]*$/i', $fieldName) === 1;
     }
 
     /**
@@ -434,14 +465,15 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             }
         }
 
-        return $data[0];
+        // Never substitute data from another repeat instance when the exact row
+        // that triggered the hook is missing.
+        return [];
     }
 
     /**
      * Builds one target payload array from mapping rules and source data.
      *
-     * Always sets the target record field to the source record id to keep record
-     * linkage explicit.
+     * Always stores the source record id in the configured secondary target field.
      *
      * @param array<string, mixed> $sourceData
      * @param array<string, mixed> $config
@@ -462,8 +494,8 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             $this->applyMapToPayload($payload, $project, $record, $instrument, $eventId, $sourceInstance, $sourceData, $map, $config);
         }
 
-        // Keep the target record ID aligned with the source record ID.
-        $payload[$config['target_record_field']] = $record;
+        // This value is used to find the same target record on future attempts.
+        $payload[$config['target_source_id_field']] = $record;
 
         if ($config['target_event'] !== '') {
             $payload['redcap_event_name'] = $config['target_event'];
@@ -760,11 +792,57 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
     }
 
     /**
+     * Finds target records already linked to this source record.
+     *
+     * @return array<int, string>
+     */
+    private function findTargetRecordIds(
+        string $apiUrl,
+        string $apiToken,
+        string $sourceRecordId,
+        array $config
+    ): array {
+        $targetRecordIdField = (string) $config['target_record_id_field'];
+        $targetSourceIdField = (string) $config['target_source_id_field'];
+        $escapedSourceRecordId = str_replace(['\\', "'"], ['\\\\', "\\'"], $sourceRecordId);
+
+        $params = [
+            'content' => 'record',
+            'action' => 'export',
+            'format' => 'json',
+            'type' => 'flat',
+            'fields' => [$targetRecordIdField, $targetSourceIdField],
+            'filterLogic' => '[' . $targetSourceIdField . "] = '" . $escapedSourceRecordId . "'",
+            'returnFormat' => 'json',
+        ];
+
+        if ($config['target_event'] !== '') {
+            $params['events'] = [$config['target_event']];
+        }
+
+        $rows = $this->callTargetApi($apiUrl, $apiToken, $params);
+        $recordIds = [];
+
+        foreach ($rows as $row) {
+            if (!is_array($row) || (string) ($row[$targetSourceIdField] ?? '') !== $sourceRecordId) {
+                continue;
+            }
+
+            $targetRecordId = trim((string) ($row[$targetRecordIdField] ?? ''));
+            if ($targetRecordId !== '') {
+                $recordIds[$targetRecordId] = true;
+            }
+        }
+
+        return array_keys($recordIds);
+    }
+
+    /**
      * Imports one payload row into target REDCap via API.
      *
      * @param array<string, string> $payload
      */
-    private function importPayload(string $apiUrl, string $apiToken, array $payload): void
+    private function importPayload(string $apiUrl, string $apiToken, array $payload, bool $createNewRecord): void
     {
         $params = [
             'content' => 'record',
@@ -777,6 +855,10 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             'returnFormat' => 'json',
         ];
 
+        if ($createNewRecord) {
+            $params['forceAutoNumber'] = 'true';
+        }
+
         $this->callTargetApi($apiUrl, $apiToken, $params);
     }
 
@@ -786,8 +868,8 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
      * Throws RuntimeException on transport failures, HTTP errors, and API-level
      * error responses.
      *
-     * @param array<string, string> $params
-     * @return array<string, mixed>
+     * @param array<string, mixed> $params
+     * @return array<mixed>
      */
     private function callTargetApi(string $url, string $token, array $params): array
     {
