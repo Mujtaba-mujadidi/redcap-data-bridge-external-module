@@ -56,7 +56,6 @@ final class RuleValidator
             'source_instrument' => self::fieldName($input['source_instrument'] ?? ''),
             'condition' => trim((string) ($input['condition'] ?? '')),
             'target_event' => self::shortText($input['target_event'] ?? '', 160),
-            'target_form' => self::fieldName($input['target_form'] ?? ''),
             'target_record_id_field' => self::fieldName($input['target_record_id_field'] ?? ''),
             'target_source_id_field' => self::fieldName($input['target_source_id_field'] ?? ''),
             'status_field' => self::fieldName($input['status_field'] ?? ''),
@@ -78,15 +77,9 @@ final class RuleValidator
             $errors[] = $label . ' contains invalid REDCap logic.';
         }
 
-        $targetForm = $target['forms'][$rule['target_form']] ?? null;
-        if (!is_array($targetForm)) {
-            $errors[] = $label . ' has an invalid target form.';
-        }
         if (!empty($target['longitudinal'])) {
             if ($rule['target_event'] === '' || !isset($target['events'][$rule['target_event']])) {
                 $errors[] = $label . ' needs a valid target event.';
-            } elseif (!in_array($rule['target_form'], $target['events'][$rule['target_event']]['forms'] ?? [], true)) {
-                $errors[] = $label . ' target form is not assigned to the selected event.';
             }
         } else {
             $rule['target_event'] = '';
@@ -97,9 +90,11 @@ final class RuleValidator
             $errors[] = $label . ' has an invalid target record ID field.';
         }
         $sourceIdField = $target['fields'][$rule['target_source_id_field']] ?? null;
-        if (!is_array($sourceIdField) || ($sourceIdField['form'] ?? '') !== $rule['target_form']
-            || ($sourceIdField['type'] ?? '') !== 'text') {
-            $errors[] = $label . ' target source-ID field must be a text field on the target form.';
+        if (!is_array($sourceIdField) || ($sourceIdField['type'] ?? '') !== 'text') {
+            $errors[] = $label . ' target source-ID field must be a text field.';
+        } elseif (!empty($target['longitudinal']) && isset($target['events'][$rule['target_event']])
+            && !in_array($sourceIdField['form'] ?? '', $target['events'][$rule['target_event']]['forms'] ?? [], true)) {
+            $errors[] = $label . ' target source-ID field is not assigned to the selected event.';
         }
         if ($rule['target_record_id_field'] !== '' && $rule['target_record_id_field'] === $rule['target_source_id_field']) {
             $errors[] = $label . ' must use different record-ID and source-ID fields.';

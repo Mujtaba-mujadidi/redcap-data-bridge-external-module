@@ -50,7 +50,7 @@ $target = [
 $rule = [
     'id' => '', 'name' => 'Demographics', 'enabled' => true,
     'source_instrument' => 'demographics', 'condition' => "[dob] <> ''",
-    'target_event' => 'baseline_arm_1', 'target_form' => 'target_demographics',
+    'target_event' => 'baseline_arm_1',
     'target_record_id_field' => 'record_id', 'target_source_id_field' => 'source_id',
     'status_field' => 'coded_status',
     'mappings' => [
@@ -67,7 +67,7 @@ check($valid['rules'][0]['mappings'][0]['target_choice_codes'] === ['1', '2'], '
 $crossForm = $rule;
 $crossForm['mappings'][] = ['source' => 'email', 'target' => 'email', 'value_map' => []];
 $valid = RuleValidator::validate([$crossForm], $source, $target, static function (): bool { return true; });
-check($valid['errors'] === [], 'Mappings may use project fields outside the trigger and completion forms.');
+check($valid['errors'] === [], 'Mappings may use project fields outside the trigger instrument.');
 
 $missingChoice = $rule;
 $missingChoice['mappings'][0]['value_map'] = ['DR' => '1'];
@@ -106,12 +106,12 @@ check(in_array('Rule 1 status field must contain one choice labelled "Success".'
 $wrongEvent = $target;
 $wrongEvent['events']['baseline_arm_1']['forms'] = ['another_form'];
 $invalid = RuleValidator::validate([$rule], $source, $wrongEvent, static function (): bool { return true; });
-check(in_array('Rule 1 target form is not assigned to the selected event.', $invalid['errors'], true), 'A form must be assigned to its selected event.');
+check(in_array('Rule 1 target source-ID field is not assigned to the selected event.', $invalid['errors'], true), 'The source-ID field must be assigned to its selected event.');
 
 $codedSourceId = $target;
 $codedSourceId['fields']['source_id']['type'] = 'radio';
 $invalid = RuleValidator::validate([$rule], $source, $codedSourceId, static function (): bool { return true; });
-check(in_array('Rule 1 target source-ID field must be a text field on the target form.', $invalid['errors'], true), 'Target source-ID field must be text.');
+check(in_array('Rule 1 target source-ID field must be a text field.', $invalid['errors'], true), 'Target source-ID field must be text.');
 
 $validatedSourceId = $target;
 $validatedSourceId['fields']['source_id']['validation'] = 'integer';

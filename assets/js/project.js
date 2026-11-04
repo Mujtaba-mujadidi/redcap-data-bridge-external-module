@@ -226,7 +226,6 @@
                         source_instrument: value('source_instrument'),
                         condition: value('condition'),
                         target_event: value('target_event'),
-                        target_form: value('target_form'),
                         target_record_id_field: value('target_record_id_field'),
                         target_source_id_field: value('target_source_id_field'),
                         status_field: value('status_field'),
@@ -373,15 +372,14 @@
                     renderRules();
                 };
                 const sourceForm = searchableControl('source_instrument', formItems(state.source), rule.source_instrument, 'Choose source instrument', selectRuleContext);
-                const targetForm = searchableControl('target_form', formItems(state.target), rule.target_form, 'Choose target form', selectRuleContext);
                 const top = node('div', undefined, 'rdb-grid-two');
-                top.append(labelled('Rule name', name), labelled('Active', enabled), labelled('Source instrument', sourceForm), labelled('Target form', targetForm));
+                top.append(labelled('Rule name', name), labelled('Active', enabled), labelled('Source instrument', sourceForm));
                 body.appendChild(top);
 
                 const identity = node('div', undefined, 'rdb-grid-two');
                 const recordFields = Object.values(state.target?.fields || {}).filter(field => field.record_id)
                     .map(field => ({value: field.name, label: fieldOptionLabel(field)}));
-                const targetFields = fieldItems(state.target, rule.target_form, field => !field.record_id);
+                const targetFields = allFieldItems(state.target, field => !field.record_id);
                 const sourceIdField = labelled('Target source-ID field', searchableControl('target_source_id_field', targetFields.filter(field => {
                     const metadata = state.target.fields[field.value];
                     return metadata.type === 'text';
@@ -391,7 +389,7 @@
                     sourceIdField
                 );
                 if (state.target?.longitudinal) {
-                    const events = Object.values(state.target.events).filter(event => (event.forms || []).includes(rule.target_form));
+                    const events = Object.values(state.target.events);
                     identity.appendChild(labelled('Target event', searchableControl('target_event', events.map(event => ({value: event.name, label: '[' + event.name + ']: ' + event.label})), rule.target_event, 'Choose target event')));
                 } else {
                     const hidden = document.createElement('input'); hidden.type = 'hidden'; hidden.name = 'target_event'; hidden.value = '';
@@ -619,7 +617,7 @@
             byId('connection-form').addEventListener('submit', event => { event.preventDefault(); connectionAction('save-connection'); });
             byId('test-connection').addEventListener('click', () => connectionAction('test-connection'));
             byId('add-rule').addEventListener('click', () => {
-                syncRulesFromPage(); rules.push({id: '', name: '', enabled: true, source_instrument: '', condition: '', target_event: '', target_form: '', target_record_id_field: '', target_source_id_field: '', status_field: '', status_success_value: '', status_failed_value: '', mappings: []}); expandedRuleIndex = rules.length - 1; renderRules();
+                syncRulesFromPage(); rules.push({id: '', name: '', enabled: true, source_instrument: '', condition: '', target_event: '', target_record_id_field: '', target_source_id_field: '', status_field: '', status_success_value: '', status_failed_value: '', mappings: []}); expandedRuleIndex = rules.length - 1; renderRules();
             });
             byId('reload').addEventListener('click', reload);
             renderAll();

@@ -62,13 +62,9 @@ A required REDCap logic expression that decides whether the transfer should proc
 
 If the condition is false, no transfer is attempted and the status field is not changed.
 
-### Target form
-
-Identifies the form containing the Target source-ID field. For longitudinal projects, it determines the available target events and must be assigned to the selected event. Other mapped fields may come from different target forms, provided those forms are also assigned to the selected event. Selecting a target form does not change its completion status.
-
 ### Target event
 
-Required only for longitudinal target projects. It tells REDCap which event receives the imported values. The selected target form must be assigned to this event.
+Required only for longitudinal target projects. It tells REDCap which event receives the imported values. The forms containing the Target source-ID field and every mapped target field must be assigned to this event.
 
 ### Target record ID field
 
@@ -76,7 +72,7 @@ The target project's primary record ID field. For a new transfer, the module sen
 
 ### Target source-ID field
 
-A text field in the target form that stores the source record ID. Integer validation may be used when all source record IDs are numeric. The module searches for the source record ID before every import:
+A text field in the target project that stores the source record ID. Integer validation may be used when all source record IDs are numeric. The module searches for the source record ID before every import:
 
 - No match creates a new auto-numbered target record.
 - One match updates that target record.
