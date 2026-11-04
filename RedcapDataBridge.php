@@ -4,23 +4,427 @@ namespace OxfordVaccineGroup\RedcapDataBridge;
 
 use REDCap;
 
+require_once __DIR__ . '/classes/RuleValidator.php';
+
 class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
 {
-    // Data Bridge action tag used to identify fields that should be transmitted to a target REDCap project.
-    private const ACTION_TAG = '@RDB-MAP';
+    private const CONFIGURATION_KEY = 'bridge_configuration';
     private const STATUS_SUCCESS = 'SUCCESS';
     private const STATUS_FAILED = 'FAILED';
+    private const ENCRYPTED_TOKEN_PREFIX = 'rdb-token:v1:';
 
-    // Cache parsed tag configs per project/instrument for the duration of the request.
+    // Avoid re-reading and filtering saved rules for each hook call in one request.
     private array $configCache = [];
 
-    public function redcap_survey_acknowledgement_page($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance)
+    /** Allow super users, Design users, and explicitly delegated project roles. */
+    public function canAccessProjectPage($projectId = null): bool
+    {
+        if (!$this->isAuthenticated()) {
+            return false;
+        }
+        $projectId = $projectId ?? $this->getProjectId();
+        if (filter_var($projectId, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]) === false) {
+            return false;
+        }
+        if ($this->isSuperUser()) {
+            return true;
+        }
+
+        $rights = $this->getUser()->getRights((int) $projectId);
+        if (!is_array($rights) || $rights === []) {
+            return false;
+        }
+        $expiration = (string) ($rights['expiration'] ?? '');
+        $today = defined('TODAY') ? TODAY : date('Y-m-d');
+        if ($expiration !== '' && $expiration <= $today) {
+            return false;
+        }
+        if ((string) ($rights['design'] ?? '') === '1') {
+            return true;
+        }
+
+        $roles = $this->getProjectSetting('configuration_roles', (int) $projectId);
+        $roles = is_array($roles) ? array_map('strval', array_filter($roles, 'is_scalar')) : [];
+        return !empty($rights['role_id']) && in_array((string) $rights['role_id'], $roles, true);
+    }
+
+    public function redcap_module_link_check_display($project_id, $link)
+    {
+        return $this->canAccessProjectPage($project_id) ? $link : null;
+    }
+
+    /** Return configuration data needed by the project page without exposing the API token. */
+    public function getPageState(): array
+    {
+        $this->requirePageAccess();
+        $configuration = $this->getBridgeConfiguration();
+        $target = null;
+        $connectionError = '';
+        $apiToken = $this->getApiToken();
+        if ($this->hasConnection($apiToken)) {
+            try {
+                $target = $this->loadTargetMetadata(
+                    trim((string) $this->getProjectSetting('api_url')),
+                    $apiToken
+                );
+            } catch (\Throwable $exception) {
+                $connectionError = $exception->getMessage();
+            }
+        }
+
+        return [
+            'connection' => [
+                'api_url' => trim((string) $this->getProjectSetting('api_url')),
+                'has_api_key' => $apiToken !== '',
+                'error' => $connectionError,
+            ],
+            'source' => $this->loadSourceMetadata(),
+            'target' => $target,
+            'configuration' => $this->configurationForPage($configuration),
+        ];
+    }
+
+    /** Every browser action is authenticated by the framework and rechecks project access. */
+    public function redcap_module_ajax($action, $payload, $project_id, $record, $instrument, $event_id,
+        $repeat_instance, $survey_hash, $response_id, $survey_queue_hash, $page, $page_full, $user_id, $group_id)
+    {
+        if ((int) $project_id !== (int) $this->getProjectId() || !$this->canAccessProjectPage($project_id)) {
+            return ['success' => false, 'code' => 'forbidden', 'message' => 'You do not have permission to configure Data Bridge.'];
+        }
+        try {
+            if ($action === 'reload-page') {
+                return ['success' => true, 'state' => $this->getPageState()];
+            }
+            if ($action === 'test-connection') {
+                return $this->testConnection($payload, false);
+            }
+            if ($action === 'save-connection') {
+                return $this->testConnection($payload, true);
+            }
+            if ($action === 'save-rule') {
+                return $this->saveRule($payload);
+            }
+            if ($action === 'delete-rule') {
+                return $this->deleteRule($payload);
+            }
+            return ['success' => false, 'code' => 'invalid_action', 'message' => 'This action is not supported.'];
+        } catch (\Throwable $exception) {
+            $this->log('RDB page action failed: {action}: {error}', [
+                'action' => (string) $action,
+                'error' => $exception->getMessage(),
+            ]);
+            return ['success' => false, 'code' => 'unavailable', 'message' => 'The operation could not be completed. Ask a REDCap administrator to check the module log.'];
+        }
+    }
+
+    private function testConnection($payload, bool $save): array
+    {
+        if (!is_array($payload)) {
+            return ['success' => false, 'code' => 'validation', 'message' => 'Enter the target connection details.'];
+        }
+        $url = trim((string) ($payload['api_url'] ?? ''));
+        $token = trim((string) ($payload['api_key'] ?? ''));
+        if ($token === '') {
+            $token = $this->getApiToken();
+        }
+        if (!filter_var($url, FILTER_VALIDATE_URL) || !preg_match('/^https?:\/\//i', $url) || $token === '') {
+            return ['success' => false, 'code' => 'validation', 'message' => 'Enter a valid API URL and token.'];
+        }
+
+        try {
+            $target = $this->loadTargetMetadata($url, $token);
+        } catch (\Throwable $exception) {
+            return ['success' => false, 'code' => 'connection', 'message' => 'Connection failed: ' . $exception->getMessage()];
+        }
+        if ($save) {
+            $encryptedToken = $this->encryptApiToken($token);
+            $this->setProjectSetting('api_url', $url);
+            $this->setProjectSetting('api_key', $encryptedToken);
+        }
+
+        return [
+            'success' => true,
+            'saved' => $save,
+            'message' => $save ? 'Target connection saved.' : 'Connection successful.',
+            'connection' => ['api_url' => $url, 'has_api_key' => true, 'error' => ''],
+            'target' => $target,
+        ];
+    }
+
+    private function saveRule($payload): array
+    {
+        if (!is_array($payload) || !is_int($payload['revision'] ?? null) || !is_array($payload['rule'] ?? null)) {
+            return ['success' => false, 'code' => 'validation', 'errors' => ['Reload the page before saving.']];
+        }
+        if (!$this->hasConnection()) {
+            return ['success' => false, 'code' => 'validation', 'errors' => ['Save a working target connection first.']];
+        }
+
+        return $this->withConfigurationLock(function () use ($payload) {
+            $current = $this->getBridgeConfiguration();
+            if ($payload['revision'] !== $current['revision']) {
+                return ['success' => false, 'code' => 'conflict', 'message' => 'Someone changed the rules after you opened the page. Reload before saving.'];
+            }
+            $source = $this->loadSourceMetadata();
+            $target = $this->loadTargetMetadata(
+                trim((string) $this->getProjectSetting('api_url')),
+                $this->getApiToken()
+            );
+            $result = RuleValidator::validate(
+                [$payload['rule']],
+                $source,
+                $target,
+                static function (string $logic): bool {
+                    return \LogicTester::isValid($logic);
+                }
+            );
+            if ($result['errors']) {
+                return ['success' => false, 'code' => 'validation', 'errors' => $result['errors']];
+            }
+
+            $rule = $result['rules'][0];
+            $rules = $current['rules'];
+            if ($rule['id'] === '') {
+                if (count($rules) >= 50) {
+                    return ['success' => false, 'code' => 'validation', 'errors' => ['A project can contain no more than 50 transfer rules.']];
+                }
+                $rule['id'] = 'rdb_' . bin2hex(random_bytes(12));
+                $rules[] = $rule;
+            } else {
+                $index = array_search($rule['id'], array_column($rules, 'id'), true);
+                if ($index === false) {
+                    return ['success' => false, 'code' => 'conflict', 'message' => 'This rule no longer exists. Reload the page.'];
+                }
+                $rules[$index] = $rule;
+            }
+            if ($rules === $current['rules']) {
+                return ['success' => true, 'saved_rule_id' => $rule['id'], 'configuration' => $this->configurationForPage($current), 'message' => 'No changes to save.'];
+            }
+            $next = $this->persistRules($current, $rules);
+            return ['success' => true, 'saved_rule_id' => $rule['id'], 'configuration' => $this->configurationForPage($next), 'message' => 'Transfer rule saved.'];
+        });
+    }
+
+    private function deleteRule($payload): array
+    {
+        if (!is_array($payload) || !is_int($payload['revision'] ?? null) || !is_string($payload['id'] ?? null)) {
+            return ['success' => false, 'code' => 'validation', 'message' => 'Reload the page before removing this rule.'];
+        }
+        return $this->withConfigurationLock(function () use ($payload) {
+            $current = $this->getBridgeConfiguration();
+            if ($payload['revision'] !== $current['revision']) {
+                return ['success' => false, 'code' => 'conflict', 'message' => 'Someone changed the rules after you opened the page. Reload before removing this rule.'];
+            }
+            $rules = array_values(array_filter($current['rules'], static function (array $rule) use ($payload): bool {
+                return ($rule['id'] ?? '') !== $payload['id'];
+            }));
+            if (count($rules) === count($current['rules'])) {
+                return ['success' => false, 'code' => 'conflict', 'message' => 'This rule no longer exists. Reload the page.'];
+            }
+            $next = $this->persistRules($current, $rules);
+            return ['success' => true, 'configuration' => $this->configurationForPage($next), 'message' => 'Transfer rule removed.'];
+        });
+    }
+
+    private function persistRules(array $current, array $rules): array
+    {
+        $next = [
+            'schema_version' => 1,
+            'revision' => $current['revision'] + 1,
+            'rules' => $rules,
+        ];
+        $this->setProjectSetting(self::CONFIGURATION_KEY, $next);
+        $this->configCache = [];
+        return $next;
+    }
+
+    /** Source metadata is read locally; participant values are never loaded for this page. */
+    private function loadSourceMetadata(): array
+    {
+        $project = new \Project((int) $this->getProjectId());
+        $forms = [];
+        foreach ($project->forms as $name => $details) {
+            $forms[$name] = ['name' => $name, 'label' => $this->plainLabel($details['menu'] ?? $name), 'fields' => []];
+        }
+        $fields = [];
+        foreach ($project->metadata as $name => $metadata) {
+            $form = (string) ($metadata['form_name'] ?? '');
+            if (!isset($forms[$form]) || $name === $form . '_complete') {
+                continue;
+            }
+            $field = [
+                'name' => $name,
+                'label' => $this->plainLabel($metadata['element_label'] ?? $name),
+                'form' => $form,
+                'type' => $this->normaliseFieldType((string) ($metadata['element_type'] ?? '')),
+                'validation' => (string) ($metadata['element_validation_type'] ?? ''),
+                'choices' => $this->parseChoices((string) ($metadata['element_enum'] ?? '')),
+                'record_id' => $name === $project->table_pk,
+            ];
+            $fields[$name] = $field;
+            $forms[$form]['fields'][] = $name;
+        }
+        return ['project_title' => (string) $project->project['app_title'], 'longitudinal' => (bool) $project->longitudinal, 'forms' => $forms, 'fields' => $fields];
+    }
+
+    /** Fetch and normalize only structural metadata required by the mapping page. */
+    private function loadTargetMetadata(string $url, string $token): array
+    {
+        $projectInfo = $this->callTargetApi($url, $token, [
+            'content' => 'project', 'format' => 'json', 'returnFormat' => 'json',
+        ]);
+        $metadataRows = $this->callTargetApi($url, $token, [
+            'content' => 'metadata', 'format' => 'json', 'returnFormat' => 'json',
+        ]);
+        $longitudinal = !empty($projectInfo['is_longitudinal']);
+        $events = [];
+        if ($longitudinal) {
+            $eventRows = $this->callTargetApi($url, $token, [
+                'content' => 'event', 'format' => 'json', 'returnFormat' => 'json',
+            ]);
+            foreach ($eventRows as $event) {
+                if (!is_array($event) || empty($event['unique_event_name'])) {
+                    continue;
+                }
+                $events[(string) $event['unique_event_name']] = [
+                    'name' => (string) $event['unique_event_name'],
+                    'label' => $this->plainLabel($event['event_name'] ?? $event['unique_event_name']),
+                    'forms' => [],
+                ];
+            }
+
+            $formEventRows = $this->callTargetApi($url, $token, [
+                'content' => 'formEventMapping', 'format' => 'json', 'returnFormat' => 'json',
+            ]);
+            foreach ($formEventRows as $mapping) {
+                $eventName = (string) ($mapping['unique_event_name'] ?? '');
+                $formName = (string) ($mapping['form'] ?? '');
+                if ($eventName !== '' && $formName !== '' && isset($events[$eventName])) {
+                    $events[$eventName]['forms'][] = $formName;
+                }
+            }
+        }
+
+        $forms = [];
+        $fields = [];
+        foreach ($metadataRows as $rowIndex => $metadata) {
+            if (!is_array($metadata) || empty($metadata['field_name']) || empty($metadata['form_name'])) {
+                continue;
+            }
+            $name = (string) $metadata['field_name'];
+            $form = (string) $metadata['form_name'];
+            if (!isset($forms[$form])) {
+                $forms[$form] = ['name' => $form, 'label' => $form, 'fields' => []];
+            }
+            if ($name === $form . '_complete') {
+                continue;
+            }
+            $field = [
+                'name' => $name,
+                'label' => $this->plainLabel($metadata['field_label'] ?? $name),
+                'form' => $form,
+                'type' => $this->normaliseFieldType((string) ($metadata['field_type'] ?? '')),
+                'validation' => (string) ($metadata['text_validation_type_or_show_slider_number'] ?? ''),
+                'choices' => $this->parseChoices((string) ($metadata['select_choices_or_calculations'] ?? '')),
+                'record_id' => $rowIndex === 0,
+            ];
+            $fields[$name] = $field;
+            $forms[$form]['fields'][] = $name;
+        }
+        if (!$fields) {
+            throw new \RuntimeException('The target project returned no metadata.');
+        }
+
+        return [
+            'project_title' => $this->plainLabel($projectInfo['project_title'] ?? 'Target REDCap project'),
+            'longitudinal' => $longitudinal,
+            'events' => $events,
+            'forms' => $forms,
+            'fields' => $fields,
+        ];
+    }
+
+    private function getBridgeConfiguration(): array
+    {
+        $value = $this->getProjectSetting(self::CONFIGURATION_KEY);
+        if ($value === null) {
+            return ['schema_version' => 1, 'revision' => 0, 'rules' => []];
+        }
+        if (!is_array($value) || ($value['schema_version'] ?? null) !== 1
+            || !is_int($value['revision'] ?? null) || !is_array($value['rules'] ?? null)) {
+            throw new \RuntimeException('Stored Data Bridge configuration has an unsupported format.');
+        }
+        // Older configurations may contain a history key. It is deliberately
+        // ignored and will be removed the next time a rule is saved.
+        return [
+            'schema_version' => 1,
+            'revision' => $value['revision'],
+            'rules' => $value['rules'],
+        ];
+    }
+
+    private function configurationForPage(array $configuration): array
+    {
+        return [
+            'revision' => $configuration['revision'],
+            'rules' => $configuration['rules'],
+        ];
+    }
+
+    /** Encrypt a target API token with REDCap's installation-specific key. */
+    private function encryptApiToken(string $token): string
+    {
+        if ($token === '' || !function_exists('encrypt')) {
+            throw new \RuntimeException('REDCap token encryption is not available.');
+        }
+        $encrypted = \encrypt($token);
+        if (!is_string($encrypted) || $encrypted === '') {
+            throw new \RuntimeException('REDCap could not encrypt the target API token.');
+        }
+        return self::ENCRYPTED_TOKEN_PREFIX . $encrypted;
+    }
+
+    /**
+     * Return the decrypted token and migrate legacy plaintext settings in place.
+     * A prefix distinguishes ciphertext from older tokens without guessing.
+     */
+    private function getApiToken(): string
+    {
+        $stored = trim((string) $this->getProjectSetting('api_key'));
+        if ($stored === '') {
+            return '';
+        }
+        if (strpos($stored, self::ENCRYPTED_TOKEN_PREFIX) === 0) {
+            if (!function_exists('decrypt')) {
+                throw new \RuntimeException('REDCap token decryption is not available.');
+            }
+            $token = \decrypt(substr($stored, strlen(self::ENCRYPTED_TOKEN_PREFIX)));
+            if (!is_string($token) || $token === '') {
+                throw new \RuntimeException('The stored target API token could not be decrypted.');
+            }
+            return $token;
+        }
+
+        // Tokens saved by earlier module versions were plaintext. Re-save once
+        // as ciphertext, then continue using the original value for this request.
+        $this->setProjectSetting('api_key', $this->encryptApiToken($stored));
+        return $stored;
+    }
+
+    private function hasConnection(?string $apiToken = null): bool
+    {
+        return trim((string) $this->getProjectSetting('api_url')) !== ''
+            && ($apiToken ?? $this->getApiToken()) !== '';
+    }
+
+    public function redcap_survey_complete($project_id, $record, $instrument, $event_id, $group_id, $survey_hash, $response_id, $repeat_instance)
     {
         static $isHandlingTransmission = false;
 
         // Prevent recursive calls and skip if required parameters are missing.
         if (
             $isHandlingTransmission ||
+            $record === null ||
             $record === '' ||
             $instrument === '' ||
             empty($project_id) ||
@@ -29,23 +433,21 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             return;
         }
 
-
-        $configs = $this->getTransmissionConfigs((int) $project_id, (string) $instrument);
-        if (empty($configs)) {
-            return;
-        }
-
-        $apiUrl = trim((string) $this->getProjectSetting('api_url'));
-        $apiToken = trim((string) $this->getProjectSetting('api_key'));
-
-        if ($apiUrl === '' || $apiToken === '') {
-            $this->log('RDB-MAP transmission skipped because api_url or api_key is not configured.', []);
-            return;
-        }
-
         $isHandlingTransmission = true;
 
         try {
+            $configs = $this->getTransmissionConfigs((int) $project_id, (string) $instrument);
+            if (empty($configs)) {
+                return;
+            }
+
+            $apiUrl = trim((string) $this->getProjectSetting('api_url'));
+            $apiToken = $this->getApiToken();
+            if ($apiUrl === '' || $apiToken === '') {
+                $this->log('Data Bridge transmission skipped because the target connection is not configured.', []);
+                return;
+            }
+
             $project = new \Project((int) $project_id);
             $sourceInstance = $this->normaliseInstance($repeat_instance);
             $sourceRepeatInstrument = $project->isRepeatingForm($event_id, $instrument) ? (string) $instrument : '';
@@ -64,13 +466,21 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
                     $config
                 );
             }
+        } catch (\Throwable $exception) {
+            // Per-rule transfer failures are handled below. This catches failures
+            // while loading configuration, connection details, or project context.
+            $this->log(
+                'Data Bridge could not start the transfer for record "' . (string) $record .
+                '" on instrument "' . (string) $instrument . '": ' . $exception->getMessage(),
+                []
+            );
         } finally {
             $isHandlingTransmission = false;
         }
     }
 
     /**
-     * Executes one parsed tag configuration from start to finish.
+     * Executes one saved transfer rule from start to finish.
      *
      * This method validates preconditions, reads source values, builds payload,
      * imports to target REDCap, and records SUCCESS/FAILED state.
@@ -88,13 +498,15 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
         array $config
     ): void {
         $statusField = (string) ($config['status_field'] ?? '');
+        $successStatus = (string) ($config['status_success_value'] ?? self::STATUS_SUCCESS);
+        $failedStatus = (string) ($config['status_failed_value'] ?? self::STATUS_FAILED);
 
         try {
             if (!$this->conditionPasses($projectId, $record, $eventId, $sourceInstance, $sourceRepeatInstrument, $instrument, $config)) {
                 return;
             }
 
-            if (!$this->statusFieldIsValid($project, $instrument, $statusField)) {
+            if (!$this->statusFieldIsValid($project, $statusField, $successStatus, $failedStatus)) {
                 return;
             }
 
@@ -105,18 +517,33 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
 
             if (!empty($sourceFields) && empty($sourceData)) {
                 $this->log(
-                    'RDB-MAP skipped tag on field "' . $config['source_field'] .
-                    '" because no source data was found for record "' . $record . '".'
+                    'RDB rule "' . $config['name'] . '" found no source data for record "' . $record . '".'
                     , []
                 );
                 return;
+            }
+
+            // The status field may be on a different form, so read its own row
+            // instead of assuming it is present on the triggering form's row.
+            if ($statusField !== '') {
+                $statusInstrument = (string) ($project->metadata[$statusField]['form_name'] ?? '');
+                $statusData = $this->getCurrentSourceRow(
+                    $project,
+                    $projectId,
+                    $record,
+                    $statusInstrument,
+                    $eventId,
+                    $sourceInstance,
+                    [$statusField]
+                );
+                $sourceData[$statusField] = $statusData[$statusField] ?? '';
             }
 
             if ($this->sourceStatusBlocksTransmission($sourceData, $statusField)) {
                 return;
             }
 
-            $payload = $this->buildPayload($project, $record, $instrument, $eventId, $sourceInstance, $sourceData, $config);
+            $payload = $this->buildPayload($record, $sourceData, $config);
             $targetRecordIds = $this->findTargetRecordIds($apiUrl, $apiToken, $record, $config);
 
             if (count($targetRecordIds) > 1) {
@@ -131,21 +558,18 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             $payload[$config['target_record_id_field']] = $createNewRecord ? $record : $targetRecordIds[0];
 
             $this->importPayload($apiUrl, $apiToken, $payload, $createNewRecord);
-            $this->saveSourceStatusSafely($project, $projectId, $record, $instrument, $eventId, $sourceInstance, $statusField, self::STATUS_SUCCESS);
+            $this->saveSourceStatusSafely($project, $projectId, $record, $instrument, $eventId, $sourceInstance, $statusField, $successStatus);
         } catch (\Throwable $exception) {
-            $message = 'RDB-MAP failed for record "' . $record . '" on instrument "' . $instrument .
-                '" from tag #' . $config['tag_index'] . ' on field "' . $config['source_field'] .
-                '": ' . $exception->getMessage();
+            $message = 'RDB rule "' . $config['name'] . '" failed for record "' . $record .
+                '" on instrument "' . $instrument . '": ' . $exception->getMessage();
 
-            $this->saveSourceStatusSafely($project, $projectId, $record, $instrument, $eventId, $sourceInstance, $statusField, self::STATUS_FAILED);
+            $this->saveSourceStatusSafely($project, $projectId, $record, $instrument, $eventId, $sourceInstance, $statusField, $failedStatus);
             $this->log($message, []);
         }
     }
 
     /**
-     * Evaluates an optional REDCap logic expression for a mapping config.
-     *
-     * Empty condition means "always true".
+     * Evaluates the required REDCap logic expression for a transfer rule.
      */
     private function conditionPasses(
         int $projectId,
@@ -158,7 +582,9 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
     ): bool {
         $condition = trim((string) ($config['condition'] ?? ''));
         if ($condition === '') {
-            return true;
+            // Stored rules should already be validated, but fail closed if an old
+            // or malformed configuration reaches the runtime path.
+            return false;
         }
 
         return REDCap::evaluateLogic(
@@ -172,212 +598,24 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
         ) === true;
     }
 
-    /**
-     * Builds and caches all RDB-MAP transmission configs for one instrument.
-     *
-     * Source of truth is REDCap metadata (data dictionary) for fields on the
-     * current instrument. For each field annotation containing @RDB-MAP, this
-     * method delegates parsing to extractTagConfigs() and flattens all parsed
-     * tags into a single config list.
-     *
-     * @param int $projectId Current REDCap project id.
-     * @param string $instrument Instrument name whose fields should be scanned.
-     * @return array<int, array<string, mixed>> Parsed config objects.
-     */
+    /** Return enabled saved rules for the instrument that triggered the survey hook. */
     private function getTransmissionConfigs(int $projectId, string $instrument): array
     {
-        //If the configs for this project/instrument are already cached, return them.
         if (isset($this->configCache[$projectId][$instrument])) {
             return $this->configCache[$projectId][$instrument];
         }
-
-        $instrumentFields = REDCap::getFieldNames($instrument);
-        if (empty($instrumentFields)) {
-            $this->configCache[$projectId][$instrument] = [];
-            return [];
-        }
-
-
-        $fieldsAttributes = REDCap::getDataDictionary($projectId, 'array', false, $instrumentFields);
         $configs = [];
-
-        foreach ($fieldsAttributes as $fieldAttribute) {
-            $annotation = trim((string) ($fieldAttribute['field_annotation'] ?? ''));
-            //Skip if field annotation is empty or does not contain the action tag.
-            if ($annotation === '' || stripos($annotation, self::ACTION_TAG) === false) {
-                continue;
-            }
-
-            $fieldName = (string) ($fieldAttribute['field_name'] ?? '');
-            foreach ($this->extractTagConfigs($annotation, $fieldName) as $config) {
-                $configs[] = $config;
+        foreach ($this->getBridgeConfiguration()['rules'] as $rule) {
+            if (!empty($rule['enabled']) && ($rule['source_instrument'] ?? '') === $instrument) {
+                $configs[] = $rule;
             }
         }
-
         $this->configCache[$projectId][$instrument] = $configs;
         return $configs;
     }
 
     /**
-     * Extracts and normalises one or more @RDB-MAP(...) tags from a field annotation.
-     *
-     * Parsing behaviour:
-     * - Tag name matching is case-insensitive (@RDB-MAP, @rdb-map, etc.).
-     * - Attribute names are case-insensitive and normalised to lower-case keys.
-     * - Attribute values must be in double quotes (key="value").
-     * - map="source=>target" can appear multiple times and is collected as a list.
-     *
-     * Validation behaviour:
-     * - target_record_id_field and target_source_id_field are required per tag.
-     * - At least one valid map entry is required per tag.
-     * - Invalid tags are skipped with a log entry; parsing continues for other tags.
-     *
-     * @param string $annotation Raw REDCap field annotation text.
-     * @param string $fieldName Field name used for log context.
-     * @return array<int, array<string, mixed>> List of parsed tag configs.
-     */
-    private function extractTagConfigs(string $annotation, string $fieldName): array
-    {
-        // Match full @RDB-MAP(...) blocks.
-        // The recursive (?<inner>...) group allows nested parentheses and quoted
-        // substrings inside the tag body without prematurely terminating the match.
-        $pattern = '/@RDB-MAP\s*\(\s*(?<inner>(?:[^()"\'()]+' .
-            '|"(?:\\\\.|[^"\\\\])*"|\'(?:\\\\.|[^\'\\\\])*\'|\((?&inner)\))*)\s*\)/si';
-
-        $configs = [];
-        if (!preg_match_all($pattern, $annotation, $matches, PREG_SET_ORDER)) {
-            return $configs;
-        }
-
-        foreach ($matches as $index => $match) {
-            $rawAttributes = $match['inner'] ?? '';
-            $attributes = [];
-
-            // Parse attributes in key="value" form.
-            // Example: map="mrn=>target_mrn" target_record_id_field="record_id"
-            if (preg_match_all('/([a-z_]+)\s*=\s*"((?:\\\\.|[^"\\\\])*)"/i', $rawAttributes, $attributeMatches, PREG_SET_ORDER)) {
-                foreach ($attributeMatches as $attributeMatch) {
-                    $key = strtolower($attributeMatch[1]);
-                    $value = stripcslashes($attributeMatch[2]);
-
-                    // 'map' can be repeated, so we collect all entries.
-                    if ($key === 'map') {
-                        $attributes['map'][] = $value;
-                        continue;
-                    }
-
-                    $attributes[$key] = trim($value);
-                }
-            }
-
-            $targetRecordIdField = trim((string) ($attributes['target_record_id_field'] ?? ''));
-            $targetSourceIdField = trim((string) ($attributes['target_source_id_field'] ?? ''));
-
-            if ($targetRecordIdField === '' || $targetSourceIdField === '') {
-                $this->log(
-                    'RDB-MAP skipped a tag on field "' . $fieldName .
-                    '" because target_record_id_field or target_source_id_field is missing.',
-                    []
-                );
-                continue;
-            }
-
-            if (!$this->isValidFieldName($targetRecordIdField) || !$this->isValidFieldName($targetSourceIdField)) {
-                $this->log(
-                    'RDB-MAP skipped a tag on field "' . $fieldName .
-                    '" because a target ID field name is invalid.',
-                    []
-                );
-                continue;
-            }
-
-            if ($targetRecordIdField === $targetSourceIdField) {
-                $this->log(
-                    'RDB-MAP skipped a tag on field "' . $fieldName .
-                    '" because target_record_id_field and target_source_id_field must be different fields.',
-                    []
-                );
-                continue;
-            }
-
-            // Convert raw map strings into [{source, target}, ...].
-            $maps = $this->parseMaps($attributes['map'] ?? [], $fieldName, $index + 1);
-            if (empty($maps)) {
-                // A tag without usable mappings cannot produce a payload.
-                $this->log('RDB-MAP skipped a tag on field "' . $fieldName . '" because no valid map entries were found.', []);
-                continue;
-            }
-
-            // Normalised config consumed by downstream transmission logic.
-            $configs[] = [
-                'condition' => trim((string) ($attributes['condition'] ?? '')),
-                'target_record_id_field' => $targetRecordIdField,
-                'target_source_id_field' => $targetSourceIdField,
-                'target_form' => trim((string) ($attributes['target_form'] ?? '')),
-                'target_event' => trim((string) ($attributes['target_event'] ?? '')),
-                'status_field' => trim((string) ($attributes['status_field'] ?? '')),
-                'maps' => $maps,
-                'source_field' => $fieldName,
-                'tag_index' => $index + 1,
-            ];
-        }
-
-        return $configs;
-    }
-
-    /**
-     * Parses map="source=>target" entries into structured source/target pairs.
-     *
-     * Invalid entries are skipped and logged (missing =>, blank side, etc.).
-     *
-     * @param array<int, string> $rawMaps Raw map strings from tag attributes.
-     * @param string $fieldName Field name used for log context.
-     * @param int $tagIndex 1-based index of tag occurrence in annotation.
-     * @return array<int, array{source:string,target:string}>
-     */
-    private function parseMaps(array $rawMaps, string $fieldName, int $tagIndex): array
-    {
-        $maps = [];
-
-        foreach ($rawMaps as $rawMap) {
-            if (strpos($rawMap, '=>') === false) {
-                $this->log(
-                    'RDB-MAP skipped one map entry on field "' . $fieldName .
-                    '" in tag #' . $tagIndex . ' because it does not contain "=>".'
-                    , []
-                );
-                continue;
-            }
-
-            [$sourceField, $targetField] = array_map('trim', explode('=>', $rawMap, 2));
-            if ($sourceField === '' || $targetField === '') {
-                $this->log(
-                    'RDB-MAP skipped one map entry on field "' . $fieldName .
-                    '" in tag #' . $tagIndex . ' because the source or target field is blank.'
-                    , []
-                );
-                continue;
-            }
-
-            $maps[] = [
-                'source' => $sourceField,
-                'target' => $targetField,
-            ];
-        }
-
-        return $maps;
-    }
-
-    private function isValidFieldName(string $fieldName): bool
-    {
-        return preg_match('/^[a-z][a-z0-9_]*$/i', $fieldName) === 1;
-    }
-
-    /**
-     * Computes source field names needed for a single config.
-     *
-     * Base checkbox names are included once, and special runtime tokens are ignored
-     * because they are resolved without reading source data.
+     * Computes the source fields needed for one transfer rule.
      *
      * @param array<string, mixed> $config
      * @return array<int, string>
@@ -386,18 +624,8 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
     {
         $fields = [];
 
-        foreach ($config['maps'] as $map) {
-            $source = (string) $map['source'];
-            if ($this->isSpecialSource($source)) {
-                continue;
-            }
-
-            $fields[] = $this->getBaseFieldName($source);
-        }
-
-        $statusField = trim((string) ($config['status_field'] ?? ''));
-        if ($statusField !== '') {
-            $fields[] = $statusField;
+        foreach ($config['mappings'] as $mapping) {
+            $fields[] = (string) $mapping['source'];
         }
 
         return array_values(array_unique($fields));
@@ -473,25 +701,18 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
     /**
      * Builds one target payload array from mapping rules and source data.
      *
-     * Always stores the source record id in the configured secondary target field.
+     * Always stores the source record ID in the configured secondary target field.
      *
      * @param array<string, mixed> $sourceData
      * @param array<string, mixed> $config
      * @return array<string, string>
      */
-    private function buildPayload(
-        \Project $project,
-        string $record,
-        string $instrument,
-        int $eventId,
-        int $sourceInstance,
-        array $sourceData,
-        array $config
-    ): array {
+    private function buildPayload(string $record, array $sourceData, array $config): array
+    {
         $payload = [];
 
-        foreach ($config['maps'] as $map) {
-            $this->applyMapToPayload($payload, $project, $record, $instrument, $eventId, $sourceInstance, $sourceData, $map, $config);
+        foreach ($config['mappings'] as $mapping) {
+            $this->applyMappingToPayload($payload, $sourceData, $mapping);
         }
 
         // This value is used to find the same target record on future attempts.
@@ -501,75 +722,40 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             $payload['redcap_event_name'] = $config['target_event'];
         }
 
-        if ($config['target_form'] !== '') {
-            $payload[$config['target_form'] . '_complete'] = '2';
-        }
-
         return $payload;
     }
 
     /**
-     * Applies a single map entry to the outgoing payload.
-     *
-     * Supports special runtime tokens, explicit checkbox codes, and base-field
-     * checkbox expansion.
+     * Apply one validated mapping, translating choice codes when configured.
      *
      * @param array<string, string> $payload
      * @param array<string, mixed> $sourceData
-     * @param array<string, string> $map
-     * @param array<string, mixed> $config
+     * @param array<string, mixed> $mapping
      */
-    private function applyMapToPayload(
+    private function applyMappingToPayload(
         array &$payload,
-        \Project $project,
-        string $record,
-        string $instrument,
-        int $eventId,
-        int $sourceInstance,
         array $sourceData,
-        array $map,
-        array $config
+        array $mapping
     ): void {
-        $sourceField = (string) $map['source'];
-        $targetField = (string) $map['target'];
-
-        if ($this->isSpecialSource($sourceField)) {
-            $payload[$targetField] = $this->resolveScalarSourceValue(
-                $sourceField,
-                $project,
-                $record,
-                $instrument,
-                $eventId,
-                $sourceInstance,
-                $sourceData
-            );
-            return;
-        }
-
-        if (strpos($sourceField, '___') !== false) {
-            $payload[$targetField] = $this->normaliseFieldValue($sourceData[$sourceField] ?? '');
-            return;
-        }
+        $sourceField = (string) $mapping['source'];
+        $targetField = (string) $mapping['target'];
+        $valueMap = is_array($mapping['value_map'] ?? null) ? $mapping['value_map'] : [];
 
         $checkboxValues = $this->extractCheckboxValues($sourceField, $sourceData);
         if (!empty($checkboxValues)) {
-            if (strpos($targetField, '___') !== false) {
-                $this->log(
-                    'RDB-MAP skipped checkbox base mapping "' . $sourceField . '=>' . $targetField .
-                    '" on field "' . $config['source_field'] . '". Use explicit checkbox codes instead.'
-                    , []
-                );
-                return;
+            foreach (($mapping['target_choice_codes'] ?? []) as $targetCode) {
+                $payload[$targetField . '___' . $targetCode] = '0';
             }
-
             foreach ($checkboxValues as $checkboxField => $value) {
-                $suffix = substr($checkboxField, strlen($sourceField));
-                $payload[$targetField . $suffix] = $value;
+                $sourceCode = substr($checkboxField, strlen($sourceField) + 3);
+                $targetCode = (string) ($valueMap[$sourceCode] ?? $sourceCode);
+                $payload[$targetField . '___' . $targetCode] = $value;
             }
             return;
         }
 
-        $payload[$targetField] = $this->normaliseFieldValue($sourceData[$sourceField] ?? '');
+        $value = $this->normaliseFieldValue($sourceData[$sourceField] ?? '');
+        $payload[$targetField] = $value !== '' && isset($valueMap[$value]) ? (string) $valueMap[$value] : $value;
     }
 
     /**
@@ -596,117 +782,39 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
     }
 
     /**
-     * Resolves a map source into a scalar string value.
-     *
-     * Special tokens are resolved first; otherwise source data is read directly.
-     *
-     * @param array<string, mixed> $sourceData
+     * Validates the configured status field can store the configured outcome.
      */
-    private function resolveScalarSourceValue(
-        string $sourceField,
+    private function statusFieldIsValid(
         \Project $project,
-        string $record,
-        string $instrument,
-        int $eventId,
-        int $sourceInstance,
-        array $sourceData
-    ): string {
-        $specialValue = $this->resolveSpecialSourceValue($sourceField, $project, $record, $instrument, $eventId, $sourceInstance);
-        if ($specialValue !== null) {
-            return $specialValue;
-        }
-
-        return $this->normaliseFieldValue($sourceData[$sourceField] ?? '');
-    }
-
-    /**
-     * Resolves supported special source tokens to runtime values.
-     *
-     * Returns null when the source is not a recognised token.
-     */
-    private function resolveSpecialSourceValue(
-        string $sourceField,
-        \Project $project,
-        string $record,
-        string $instrument,
-        int $eventId,
-        int $sourceInstance
-    ): ?string {
-        switch (strtoupper($sourceField)) {
-            case '__RECORD_ID__':
-                return $record;
-
-            case '__EVENT_ID__':
-                return (string) $eventId;
-
-            case '__EVENT_NAME__':
-                return $project->longitudinal ? (string) $project->getUniqueEventNames($eventId) : '';
-
-            case '__REPEAT_INSTANCE__':
-                return (string) $sourceInstance;
-
-            case '__INSTRUMENT__':
-                return $instrument;
-
-            default:
-                return null;
-        }
-    }
-
-    /**
-     * Checks whether a map source is one of the supported special tokens.
-     */
-    private function isSpecialSource(string $sourceField): bool
-    {
-        return in_array(strtoupper($sourceField), [
-            '__RECORD_ID__',
-            '__EVENT_ID__',
-            '__EVENT_NAME__',
-            '__REPEAT_INSTANCE__',
-            '__INSTRUMENT__',
-        ], true);
-    }
-
-    /**
-     * Removes checkbox suffix from a field name, if present.
-     */
-    private function getBaseFieldName(string $fieldName): string
-    {
-        return strpos($fieldName, '___') !== false
-            ? (string) strstr($fieldName, '___', true)
-            : $fieldName;
-    }
-
-    /**
-     * Validates the configured status field is a text field on this instrument.
-     */
-    private function statusFieldIsValid(\Project $project, string $instrument, string $statusField): bool
+        string $statusField,
+        string $successStatus,
+        string $failedStatus
+    ): bool
     {
         if ($statusField === '') {
             return true;
         }
 
         if (!isset($project->metadata[$statusField])) {
-            $this->log('RDB-MAP skipped because status_field "' . $statusField . '" does not exist.', []);
-            return false;
-        }
-
-        $statusFieldForm = (string) ($project->metadata[$statusField]['form_name'] ?? '');
-        if ($statusFieldForm !== $instrument) {
-            $this->log(
-                'RDB-MAP skipped because status_field "' . $statusField .
-                '" is not on the current instrument "' . $instrument . '".'
-                , []
-            );
+            $this->log('Data Bridge skipped because status field "' . $statusField . '" does not exist.', []);
             return false;
         }
 
         $statusFieldType = (string) ($project->metadata[$statusField]['element_type'] ?? '');
-        if ($statusFieldType !== 'text') {
+        if (!in_array($statusFieldType, ['radio', 'select'], true)) {
             $this->log(
-                'RDB-MAP skipped because status_field "' . $statusField . '" must be a text field.',
+                'Data Bridge skipped because status field "' . $statusField . '" has an unsupported field type.',
                 []
             );
+            return false;
+        }
+        $choices = $this->parseChoices((string) ($project->metadata[$statusField]['element_enum'] ?? ''));
+        $labelsByCode = [];
+        foreach ($choices as $choice) {
+            $labelsByCode[(string) $choice['code']] = strtolower(trim((string) $choice['label']));
+        }
+        if (($labelsByCode[$successStatus] ?? '') !== 'success' || ($labelsByCode[$failedStatus] ?? '') !== 'failed') {
+            $this->log('Data Bridge skipped because the status field no longer contains the configured Success and Failed choices.', []);
             return false;
         }
 
@@ -754,8 +862,9 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             $payload['redcap_event_name'] = (string) $project->getUniqueEventNames($eventId);
         }
 
-        if ($project->isRepeatingForm($eventId, $instrument)) {
-            $payload['redcap_repeat_instrument'] = $instrument;
+        $statusInstrument = (string) ($project->metadata[$statusField]['form_name'] ?? $instrument);
+        if ($project->isRepeatingForm($eventId, $statusInstrument)) {
+            $payload['redcap_repeat_instrument'] = $statusInstrument;
             $payload['redcap_repeat_instance'] = (string) $sourceInstance;
         } elseif ($project->isRepeatingEvent($eventId)) {
             $payload['redcap_repeat_instance'] = (string) $sourceInstance;
@@ -784,7 +893,7 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             $this->saveSourceStatus($project, $projectId, $record, $instrument, $eventId, $sourceInstance, $statusField, $statusValue);
         } catch (\Throwable $exception) {
             $this->log(
-                'RDB-MAP could not save status "' . $statusValue . '" to source field "' . $statusField .
+                'Data Bridge could not save status "' . $statusValue . '" to source field "' . $statusField .
                 '" for record "' . $record . '": ' . $exception->getMessage()
                 , []
             );
@@ -842,7 +951,7 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
      *
      * @param array<string, string> $payload
      */
-    private function importPayload(string $apiUrl, string $apiToken, array $payload, bool $createNewRecord): void
+    private function importPayload(string $apiUrl, string $apiToken, array $payload, bool $createNewRecord): array
     {
         $params = [
             'content' => 'record',
@@ -859,7 +968,7 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
             $params['forceAutoNumber'] = 'true';
         }
 
-        $this->callTargetApi($apiUrl, $apiToken, $params);
+        return $this->callTargetApi($apiUrl, $apiToken, $params);
     }
 
     /**
@@ -878,9 +987,9 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
         $curl = curl_init();
         curl_setopt($curl, CURLOPT_URL, $url);
         curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($curl, CURLOPT_AUTOREFERER, true);
-        curl_setopt($curl, CURLOPT_MAXREDIRS, 5);
+        // Do not follow redirects because an API redirect could expose the token
+        // to a different host. Administrators should save the final API URL.
+        curl_setopt($curl, CURLOPT_FOLLOWLOCATION, false);
         curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 15);
         curl_setopt($curl, CURLOPT_TIMEOUT, 60);
         curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, true);
@@ -920,6 +1029,59 @@ class RedcapDataBridge extends \ExternalModules\AbstractExternalModule
         }
 
         return $decoded;
+    }
+
+    private function withConfigurationLock(callable $callback): array
+    {
+        $name = 'redcap-data-bridge-config-' . (int) $this->getProjectId();
+        $result = $this->query('SELECT GET_LOCK(?, 5) AS acquired', [$name]);
+        if ((int) ($result->fetch_assoc()['acquired'] ?? 0) !== 1) {
+            return ['success' => false, 'code' => 'busy', 'message' => 'Another configuration change is being saved. Try again.'];
+        }
+        try {
+            return $callback();
+        } finally {
+            $this->query('SELECT RELEASE_LOCK(?)', [$name]);
+        }
+    }
+
+    private function normaliseFieldType(string $type): string
+    {
+        $aliases = ['select' => 'dropdown', 'textarea' => 'notes'];
+        return $aliases[$type] ?? $type;
+    }
+
+    /** Parse REDCap choices without changing their raw codes or order. */
+    private function parseChoices(string $choices): array
+    {
+        if (trim($choices) === '') {
+            return [];
+        }
+        $result = [];
+        // Local Project metadata may store line breaks as the two characters
+        // "\\n", while API metadata normally returns real line breaks.
+        foreach (preg_split('/\s*(?:\||\\\\n|\r\n|\r|\n)\s*/', trim($choices)) as $choice) {
+            if ($choice === '' || strpos($choice, ',') === false) {
+                continue;
+            }
+            [$code, $label] = array_map('trim', explode(',', $choice, 2));
+            if ($code !== '') {
+                $result[] = ['code' => $code, 'label' => $this->plainLabel($label)];
+            }
+        }
+        return $result;
+    }
+
+    private function plainLabel($value): string
+    {
+        return trim(html_entity_decode(strip_tags((string) $value), ENT_QUOTES, 'UTF-8'));
+    }
+
+    private function requirePageAccess(): void
+    {
+        if (!$this->canAccessProjectPage()) {
+            throw new \RuntimeException('Data Bridge configuration access is required.');
+        }
     }
 
     /**

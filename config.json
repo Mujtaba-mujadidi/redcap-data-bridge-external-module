@@ -1,11 +1,26 @@
 {
   "name": "RedcapDataBridge",
-  "description": "Transmits mapped REDCap data to another project when an @RDB-MAP condition passes on survey completion",
+  "description": "Configure validated REDCap-to-REDCap survey data transfers",
   "namespace": "OxfordVaccineGroup\\RedcapDataBridge",
-  "framework-version": 3,
-  "permissions": [
-    "redcap_survey_acknowledgement_page"
-    
+  "framework-version": 16,
+  "documentation": "README.md",
+  "links": {
+    "project": [
+      {
+        "name": "Data Bridge",
+        "key": "data-bridge",
+        "icon": "fas fa-exchange-alt",
+        "url": "pages/index.php",
+        "show-header-and-footer": true
+      }
+    ]
+  },
+  "auth-ajax-actions": [
+    "reload-page",
+    "save-connection",
+    "test-connection",
+    "save-rule",
+    "delete-rule"
   ],
   "authors": [
     {
@@ -21,18 +36,30 @@
   ],
   "project-settings": [
     {
+      "key": "configuration_roles",
+      "name": "Project roles allowed to configure Data Bridge mappings. This does not grant External Module management rights.",
+      "type": "user-role-list",
+      "repeatable": true
+    },
+    {
       "key": "api_url",
       "name": "Data Transmission URL",
-      "required": true,
+      "required": false,
       "type": "text",
+      "hidden": true,
       "default": ""
     },
     {
       "key": "api_key",
       "name": "API Key",
-      "required": true,
+      "required": false,
       "type": "password",
+      "hidden": true,
       "default": ""
     }
-  ]
+  ],
+  "compatibility": {
+    "php-version-min": "7.4.0",
+    "redcap-version-min": "15.0.9"
+  }
 }

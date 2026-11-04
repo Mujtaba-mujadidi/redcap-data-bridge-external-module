@@ -1,78 +1,132 @@
 # OVG Data Bridge
 
-OVG Data Bridge sends selected survey data from one REDCap project to another. The transfer runs when the participant reaches the survey acknowledgement page.
+OVG Data Bridge sends selected survey data from one REDCap project to another after a configured source survey is completed. Users with the module configuration access can configure connections and transfer rules from the **Data Bridge** project page.
 
-Field mappings are kept in an `@RDB-MAP(...)` action tag in the source project's data dictionary. This allows data managers to maintain the mapping without access to the External Module configuration.
+## Access
 
-## Project Settings
+The project page is available to:
 
-- `Data Transmission URL`: the target REDCap API endpoint.
-- `API Key`: an API token for the target project with permission to import and export records.
+- REDCap super users
+- Project users with Design rights
+- Members of project roles selected in the module's `configuration_roles` setting
 
-## Action Tag
+A delegated role does not need External Module management rights. The module checks access on every page and AJAX request.
 
-Add the tag to a field annotation on the source instrument. For example:
+## Before You Start
+
+The target project must have:
+
+- Record auto-numbering enabled
+- A text field that will store the source record ID
+- Fields that are compatible with the source fields being transferred
+- An API token with metadata export, record export and record import rights
+
+The source project must have a radio or dropdown status field with exactly one choice labelled `Success` and one choice labelled `Failed`. Matching is case-insensitive, and the raw choice codes may be anything.
+
+## Setup
+
+1. Enable the module in the source project.
+2. If data managers need access without Design rights, select their project roles in the module's `configuration_roles` setting.
+3. Open **Data Bridge** from the project menu.
+4. On the **Connection** tab, enter the target REDCap API URL and token.
+5. Select **Test connection** to confirm that the target metadata can be loaded.
+6. Select **Save connection**. The token is encrypted with REDCap's installation-specific encryption key before it is stored.
+7. Open **Field mappings**, add a rule, complete all required settings and save the rule.
+8. Complete a new response for the configured source survey and confirm the source status and target record.
+
+The saved token is never returned to browser JavaScript.
+
+## Transfer Rules
+
+Each rule describes one transfer and contains the following settings.
+
+### Rule name
+
+A descriptive name that helps data managers identify the transfer. It does not affect when or how the rule runs.
+
+### Active
+
+Only active rules are evaluated. A rule can be disabled temporarily without deleting its configuration.
+
+### Source instrument
+
+The survey whose completion triggers the rule. A survey chain may begin on another instrument; the rule runs when this specific survey is completed.
+
+### REDCap condition
+
+A required REDCap logic expression that decides whether the transfer should proceed for the current record, event and repeat instance. For example:
 
 ```text
-@RDB-MAP(
-  condition="[demog_complete] = '2'",
-  target_record_id_field="record_id",
-  target_source_id_field="psq_id",
-  target_form="demographics",
-  target_event="baseline_arm_1",
-  status_field="data_bridge_status",
-  map="dob=>date_of_birth",
-  map="sex=>sex",
-  map="ethnicity=>ethnicity"
-)
+[consent] = '1'
 ```
 
-## Tag Options
+If the condition is false, no transfer is attempted and the status field is not changed.
 
-- `condition` is optional REDCap logic. If it is omitted, the mapping runs whenever the survey acknowledgement page is reached.
-- `target_record_id_field` is required and must name the primary record ID field in the target project. REDCap generates this value when a new target record is created.
-- `target_source_id_field` is required and must name a secondary field in the target project. The module stores the source record ID in this field and uses it to find the same target record later.
-- These must be two different fields.
-- `target_form` is optional. When supplied, the module marks that target form Complete by setting `<target_form>_complete` to `2`.
-- `target_event` is required when the target is longitudinal. Use the target project's unique event name. It is not needed for a classic project.
-- `status_field` is optional but recommended. It must be a text field on the same source instrument. A non-text field is logged as invalid and the transfer is skipped.
-- `map` is required. Add one entry for each field using `map="source_field=>target_field"`.
+### Target form
 
-## Checkbox Behaviour
+Identifies the target form containing the secondary source-ID field. In a longitudinal target project, it is also used to show valid target events and confirm that the form is assigned to the selected event. Field mappings may use fields from any target form. Selecting a target form does not mark it complete.
 
-To copy the whole checkbox field, use `map="source_symptoms=>target_symptoms"`. The module copies each checkbox value with the same choice-code suffix, so the source and target fields should use matching choice codes.
+### Target event
 
-To map choices individually, include the checkbox suffix, for example `map="source_symptoms___1=>target_symptoms___7"`.
+Required only for longitudinal target projects. It tells REDCap which event receives the imported values. The selected target form must be assigned to this event.
 
-Do not map a checkbox base field to a single target choice, such as `map="source_symptoms=>symptoms___7"`. The module logs and skips that mapping.
+### Target record ID field
 
-## Status Field Behaviour
+The target project's primary record ID field. For a new transfer, the module sends a provisional value and asks REDCap to replace it with the next auto-numbered record ID. For an existing match, the module sends the matched target record ID so that record is updated.
 
-When `status_field` is configured, the module records the outcome in the source project:
+### Target source-ID field
 
-- blank = not attempted yet
-- `SUCCESS` = pushed successfully
-- `FAILED` = push failed and manual follow-up may be needed
+A text field in the target form that stores the source record ID. Integer validation may be used when all source record IDs are numeric. The module searches for the source record ID before every import:
 
-The module only attempts a transfer while this field is blank. To retry a transfer, clear the status field and submit the survey again.
+- No match creates a new auto-numbered target record.
+- One match updates that target record.
+- More than one match fails safely without importing data.
 
-The module does not send email notifications. If notifications are required, configure a REDCap Alert based on the status field's failed value.
+This field is the link between the source and target records and prevents a repeated survey submission from creating a duplicate target record. Record-only matching assumes that a target project receives data from one source project. Do not send records from multiple source projects to the same target when their record IDs may overlap.
 
-## Record Matching
+### Source status field
 
-Before sending data, the module searches the target project for the source record ID in `target_source_id_field`.
+A required source radio or dropdown field containing one `Success` choice and one `Failed` choice. The module detects and stores their raw codes when the rule is saved.
 
-- If there is no match, REDCap creates a new record using its next auto-numbered record ID.
-- If there is one matching record, the module updates that record using its generated target record ID.
-- If more than one target record contains the same source ID, the transfer fails and the duplicate is written to the module log.
+After a successful target import, the module writes the `Success` code. If the transfer fails, it writes the `Failed` code and records the reason in the External Module log. Any nonblank status blocks another automatic attempt. Clear the status field before resubmitting when a retry is required.
 
-The source status field remains the first check. The target lookup provides a second safeguard if the target import succeeded but the source `SUCCESS` status could not be saved.
+### Field mappings
 
-Record auto-numbering must be enabled in the target project.
+Each mapping links one source field to one target field. Selectors show fields as `[field_name]: Field label` and can be searched by field name or label. Descriptive fields are excluded because they do not store record data.
 
-## Notes
+The rule editor validates mappings against current project metadata:
 
-- The module runs on `redcap_survey_acknowledgement_page`.
-- Multiple `@RDB-MAP(...)` tags can exist on the same instrument.
-- Each valid tag is processed separately and sends its own request to the target project.
-- Existing action tags using `target_record_field` must be updated to use `target_record_id_field` and `target_source_id_field`.
+- Field types must match.
+- Text validation types must match.
+- Radio, dropdown and checkbox choices are compared.
+- Different choice codes must be mapped explicitly.
+- Differences in labels or choice order are shown to the user.
+
+Transfers use raw REDCap values rather than displayed labels. For example, a source radio value `DR` can be mapped to target code `4`.
+
+For checkboxes, each source choice is mapped to a target choice. The module sends checkbox values in REDCap's `field___code` format and sends `0` for unselected target choices.
+
+## How a Transfer Runs
+
+When the configured source survey is completed, the module:
+
+1. Loads active rules for that source instrument.
+2. Evaluates each rule's REDCap condition.
+3. Reads data from the exact source event and repeat instance.
+4. Stops if the source status field is already populated.
+5. Builds the target payload using the saved field and choice mappings.
+6. Searches the target source-ID field for the source record ID.
+7. Creates an auto-numbered target record or updates the single matching record.
+8. Writes `Success` or `Failed` to the source status field.
+
+The target form completion field is not included in the API payload, so the module does not change the destination form's completion status. If an exact repeating source row cannot be found, data from another repeat instance is never substituted.
+
+Multiple active rules may use the same source instrument. They are evaluated independently in their saved order.
+
+## Notifications and Logs
+
+The module does not send email. Use REDCap Alerts when a notification is required, for example when the source status field becomes `Failed`.
+
+Failures are written to the External Module log without storing the API token or full participant payload. Successful transfers are represented by the source status field and are not added to a separate transfer-history table.
+
+Configuration saves use a revision check and project lock so one user's changes cannot silently overwrite another user's work. The module does not retain a configuration-change history.
