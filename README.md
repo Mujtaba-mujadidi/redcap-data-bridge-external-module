@@ -64,7 +64,7 @@ If the condition is false, no transfer is attempted and the status field is not 
 
 ### Target form
 
-Identifies the target form containing the secondary source-ID field. In a longitudinal target project, it is also used to show valid target events and confirm that the form is assigned to the selected event. Field mappings may use fields from any target form. Selecting a target form does not mark it complete.
+Identifies the form containing the Target source-ID field. For longitudinal projects, it determines the available target events and must be assigned to the selected event. Other mapped fields may come from different target forms, provided those forms are also assigned to the selected event. Selecting a target form does not change its completion status.
 
 ### Target event
 
