@@ -340,7 +340,10 @@
                 card.dataset.index = String(index);
                 const heading = node('div', undefined, 'rdb-rule-heading');
                 const title = node('div', undefined, 'rdb-rule-title');
-                title.append(node('h3', rule.name || 'New transfer rule'), node('span', rule.enabled === false ? 'Inactive' : 'Active', 'rdb-rule-state'));
+                const titleText = rule.name || 'New transfer rule';
+                const titleHeading = node('h3', titleText);
+                titleHeading.title = titleText;
+                title.append(titleHeading, node('span', rule.enabled === false ? 'Inactive' : 'Active', 'rdb-rule-state'));
                 heading.appendChild(title);
                 const headingActions = node('div', undefined, 'rdb-actions');
                 const isExpanded = expandedRuleIndex === index;
@@ -372,8 +375,14 @@
                     renderRules();
                 };
                 const sourceForm = searchableControl('source_instrument', formItems(state.source), rule.source_instrument, 'Choose source instrument', selectRuleContext);
-                const top = node('div', undefined, 'rdb-grid-two');
-                top.append(labelled('Rule name', name), labelled('Active', enabled), labelled('Source instrument', sourceForm));
+                const nameField = labelled('Rule name', name);
+                nameField.className = 'rdb-rule-name-field';
+                const activeField = labelled('Active', enabled);
+                activeField.className = 'rdb-rule-active-field';
+                const sourceField = labelled('Source instrument', sourceForm);
+                sourceField.className = 'rdb-rule-source-field';
+                const top = node('div', undefined, 'rdb-rule-basics');
+                top.append(nameField, activeField, sourceField);
                 body.appendChild(top);
 
                 const identity = node('div', undefined, 'rdb-grid-two');
